@@ -1,0 +1,15 @@
+# Python 字节码
+__pycache__/
+*.py[cod]
+
+# 训练产物：每轮一个自包含目录，体积大且可重跑
+results/
+
+# 求解器落盘产物（COPT 的文件接口，见 COPT使用手册.md §0）
+*.iis
+*.lp
+*.mps
+*.bin
+*.sol
+*.bas
+*.log
