@@ -149,20 +149,23 @@ class StageSubproblem:
             self._note_state(f"pas_{mm}", [(Ly.ix_I(mm), -1.0)])
 
         # ---- 失效量 F：**整数**真变量，由两条线性不等式夹出来
-        #        Fdef_hi: F − θ·n_in ≤ 0   （占位系数 −1，set_scene 改成 −θ）
-        #        Fdef_lo: F − θ·n_in ≥ −1
-        #      F ∈ ℤ ⇒ F = ⌊θ·n⌋（向下取整）。右端只有纯结构常数 0 与 −1，
+        #        Fdef_hi: F − θ·n_in ≤ +0.5   （占位系数 −1，set_scene 改成 −θ）
+        #        Fdef_lo: F − θ·n_in ≥ −0.5
+        #      F ∈ ℤ ⇒ F = rint(θ·n)（四舍五入）。右端只有纯结构常数 ±0.5，
         #      没有一个是「由状态算出来的数」——θ 以**系数**进矩阵，对偶看得见 ∂F/∂x。
-        #      松弛后 F ∈ [θn−1, θn]，其最大值恰是 θn，故后向 LP 与连续口径同量级。
+        #      为什么用 rint 而不是 ⌊·⌋：⌊θn⌋ 在每个桶上系统性少算约半台，且当每桶
+        #      期望失效 θ·n < 1 时直接归零。实测（单仓 700~1100 台）rint 偏差 −1%~−3%，
+        #      ⌊·⌋ 达 −20%~−35%，⌈·⌉ 因正反馈超发 18 倍。见 docs/系统参数定标.md §5。
+        #      松弛后 F ∈ [θn−0.5, θn+0.5]，与连续期望值同量级。
         F_var = [[m.addVar(lb=0.0, ub=float(prob.N[r]), vtype=COPT.INTEGER,
                            name=f"F_{r}_{a}")
                   for a in range(A)] for r in range(N_R)]
         fdef_hi, fdef_lo = [], []
         for r in range(N_R):
             for a in range(A):
-                fdef_hi.append(m.addConstr(F_var[r][a] - n_in[r][a] <= 0.0,
+                fdef_hi.append(m.addConstr(F_var[r][a] - n_in[r][a] <= 0.5,
                                            name=f"Fdef_hi_{r}_{a}"))
-                fdef_lo.append(m.addConstr(F_var[r][a] - n_in[r][a] >= -1.0,
+                fdef_lo.append(m.addConstr(F_var[r][a] - n_in[r][a] >= -0.5,
                                            name=f"Fdef_lo_{r}_{a}"))
                 self._note_state(f"Fdef_hi_{r}_{a}", [(Ly.ix_n(r, a), -1.0)])
                 self._note_state(f"Fdef_lo_{r}_{a}", [(Ly.ix_n(r, a), -1.0)])

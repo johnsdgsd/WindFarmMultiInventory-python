@@ -57,7 +57,10 @@ class ProblemConfig:
     N: list
     Qmax: list
     Imax: list
-    spread_init: bool
+    # 期初月龄摊开宽度：0 = 全在月龄 0（新机队）；K>0 = 均摊在月龄 0..K−1。
+    # 为什么要这个旋钮：rint(θ·n) 要求每个 (仓, 月龄) 桶 θ·n ≳ 0.5，桶内台数不足时
+    # 整桶失效归零（实测摊到 15 档以上会一台都不失效）。所以"摊多宽"不是自由选择。
+    spread_init: int
     # 成本
     C: float
     h: float
@@ -102,6 +105,10 @@ class ProblemConfig:
                 raise ValueError(f"[fleet] {name} 不得含负值：{v}")
         if any(int(x) == 0 for x in self.Qmax):
             raise ValueError(f"[fleet] Qmax 不得含 0（仓库无法订货）：{self.Qmax}")
+        if self.spread_init < 0:
+            raise ValueError(f"[fleet] spread_init 不得为负，实际 {self.spread_init}")
+        if self.spread_init > self.A:
+            raise ValueError(f"[fleet] spread_init={self.spread_init} 超过月龄档数 A={self.A}")
 
         if self.m < 1:
             raise ValueError(f"[degradation] 威布尔形状参数 m 必须 ≥ 1"
@@ -141,6 +148,11 @@ def load_problem_config(path) -> ProblemConfig:
     cov = _section(raw, "covariate", path.name)
     scen = _section(raw, "scenario", path.name)
     prio = raw.get("priority")
+    si = _req(fleet, "spread_init", "problem.toml/fleet")
+    if isinstance(si, bool):
+        raise TypeError("problem.toml/fleet.spread_init 自 2026-10-12 起是**整数**摊开宽度"
+                        "（0 = 全在月龄 0，K = 摊在月龄 0..K−1）；写 true 会产生"
+                        "「全在月龄 0」的歧义，请改写 0 或具体档数")
     return ProblemConfig(
         T=int(_req(dim, "T", "problem.toml/dimension")),
         A=int(_req(dim, "A", "problem.toml/dimension")),
@@ -149,7 +161,7 @@ def load_problem_config(path) -> ProblemConfig:
         N=[int(v) for v in _req(fleet, "N", "problem.toml/fleet")],
         Qmax=[int(v) for v in _req(fleet, "Qmax", "problem.toml/fleet")],
         Imax=[int(v) for v in _req(fleet, "Imax", "problem.toml/fleet")],
-        spread_init=bool(_req(fleet, "spread_init", "problem.toml/fleet")),
+        spread_init=int(si),
         C=float(_req(cost, "C", "problem.toml/cost")),
         h=float(_req(cost, "h", "problem.toml/cost")),
         Cs=float(_req(cost, "Cs", "problem.toml/cost")),

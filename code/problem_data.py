@@ -183,11 +183,12 @@ def DefineProblem(cfg: ProblemConfig) -> ProblemData:
     tc_route = make_tc_route(priority, cfg.tc, N_R)
 
     n0 = np.zeros((N_R, A), dtype=np.int64)
-    if cfg.spread_init:
+    K = min(int(cfg.spread_init), A)              # 摊开宽度，0 = 全在月龄 0
+    if K > 0:
         for r in range(N_R):                      # 每仓独立摊平（异质机队）
-            base, rem = divmod(int(N[r]), A)
-            n0[r, :] = base
-            n0[r, 0] += rem
+            base, rem = divmod(int(N[r]), K)
+            n0[r, :K] = base
+            n0[r, 0] += rem                       # 余数给最新件，保证总和恰为 N
     else:
         n0[:, 0] = N
     I0 = np.zeros(N_R, dtype=np.int64)
@@ -272,8 +273,20 @@ def print_summary(prob: ProblemData, out=print) -> None:
         f"启停 Poisson({c['lambda']})  满负荷 100·Beta({c['alpha_L']}, {c['beta_L']}) (%)")
     out(f"h0: a=0 → {prob.h0[0]:.2e}  a={prob.A // 2} → {prob.h0[prob.A // 2]:.2e}  "
         f"a={prob.A - 1} → {prob.h0[-1]:.2e}")
-    out(f"硬寿命截断强度: P(存活过 A={prob.A}) = exp(-(A/η)^m) = "
-        f"{np.exp(-((prob.A / prob.eta) ** prob.m)):.3f}（宜接近 0）")
+    # 硬寿命截断（月龄 A−1 的到寿离场）只在**视界内能触达 A** 时才失真：
+    # 期初最高月龄 + T ≥ A−1 ⇒ 有机组会在 T 期内走到到寿档。否则（典型地
+    # spread_init=false 且 T < A），视界内根本到不了那里，P(存活过 A) 与结果无关，
+    # 报 0.5 也不代表模型失真 —— 所以判据用「可达性」而不是那个概率。
+    _a0 = int(np.max(np.nonzero(prob.n0.sum(axis=0) > 0)[0])) if prob.n0.sum() else 0
+    _pmax = _a0 + prob.T
+    _p_over = float(np.exp(-((prob.A / prob.eta) ** prob.m)))
+    if _pmax >= prob.A - 1:
+        out(f"硬寿命截断强度: P(存活过 A={prob.A}) = exp(-(A/η)^m) = "
+            f"{_p_over:.3f}（期初最高月龄 {_a0} + T={prob.T} = {_pmax} ≥ A−1 ⇒ "
+            f"视界内可达，宜接近 0）")
+    else:
+        out(f"硬寿命截断: 期初最高月龄 {_a0} + T={prob.T} = {_pmax} < A−1={prob.A - 1} "
+            f"⇒ 视界内触达不到 A（P(存活过 A)={_p_over:.3f}，与结果无关）")
 
     # ---- 自检 1：修正因子中心化（E[f] 应 ≈ 1）----
     rng = np.random.default_rng(prob.seed + 1000)

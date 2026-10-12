@@ -69,7 +69,7 @@ def main():
     F = np.zeros((P, T, NR))
     for t in range(T):
         th = np.array([prob.pool[scene[p, t]][1] for p in range(P)])   # (P,NR,A)
-        F[:, t, :] = np.floor(th * n_in[:, t]).sum(axis=2)
+        F[:, t, :] = np.rint(th * n_in[:, t]).sum(axis=2)
 
     print(f"{f.name}   路径 {P} × {T} 期   种子 {meta['seed']} "
           f"块 {meta.get('chunk_size', '—')}")
@@ -252,21 +252,23 @@ def main():
     util = load / prob.Imax[None, None, :]
     down = prob.N[None, None, :] - n_in.sum(axis=3)      # 停机台数
     tau_n = taup - taum                                  # 净流入（共享池，不区分对手方）
-    DIE = 119                                            # 0 基下标：第 120 期＝到寿集中爆发
+    DIE = T - 1                                          # 0 基下标：末期（T 期内 A 不触达，无到寿悬崖）
+    LO = max(0, T - 20)                                  # 只统计末 20 期的容量压力
 
-    # ---- A. 大停机前有没有提前备货？缺口是不是被容量堵死的？----
-    print("  A. 大停机（第 120 期）之前有没有囤货？缺口是不是被 ΣImax 堵死的？")
-    print("       仓   Imax    [100,119]平均load   占用率   贴满占比   全期贴满   第120期期初I")
+    # ---- A. 末期前有没有提前备货？缺口是不是被容量堵死的？----
+    print(f"  A. 末期（第 {T} 期）之前有没有囤货？缺口是不是被 ΣImax 堵死的？")
+    print(f"       仓   Imax    [{LO+1},{T}]平均load   占用率   贴满占比   全期贴满   末期期初I")
     for r in range(NR):
-        u = util[:, 99:DIE, r]
-        print(f"     {r+1:>2} {prob.Imax[r]:>7,.0f} {load[:, 99:DIE, r].mean():>15,.0f} "
+        u = util[:, LO:DIE + 1, r]
+        print(f"     {r+1:>2} {prob.Imax[r]:>7,.0f} {load[:, LO:DIE + 1, r].mean():>15,.0f} "
               f"{u.mean():>8.1%} {(u >= 1 - TOL).mean():>10.1%} "
               f"{(util[:, :, r] >= 1 - TOL).mean():>10.1%} "
               f"{I_in[:, DIE, r].mean():>14,.0f}")
-    print(f"     第 120 期期初总库存 {I_in[:, DIE, :].sum(axis=1).mean():>9,.0f} 件   "
-          f"总库容 ΣImax={prob.Imax.sum():,.0f}   第 120 期失效 {F[:, DIE, :].sum(axis=1).mean():,.0f} 台")
-    print(f"     ⇒ 缺口是否结构性的：失效 {F[:, DIE, :].sum(axis=1).mean():,.0f} 台 vs "
-          f"库容 {prob.Imax.sum():,.0f} 件 = {F[:, DIE, :].sum(axis=1).mean()/prob.Imax.sum():.1f} 倍")
+    print(f"     末期期初总库存 {I_in[:, DIE, :].sum(axis=1).mean():>9,.0f} 件   "
+          f"总库容 ΣImax={prob.Imax.sum():,.0f}   末期失效 {F[:, DIE, :].sum(axis=1).mean():,.0f} 台")
+    print(f"     ⇒ 缺口是否结构性的：末期失效 {F[:, DIE, :].sum(axis=1).mean():,.0f} 台 vs "
+          f"总库容 {prob.Imax.sum():,.0f} 件 = {F[:, DIE, :].sum(axis=1).mean()/prob.Imax.sum():.1f} 倍   "
+          f"vs 订货上限 ΣQmax={prob.Qmax.sum():,.0f} 台/期")
 
     # ---- B. 订货 ----
     print("\n  B. 订货 q：是不是 order-up-to 型？（q>0 时 load=I_out+Σo_out+q 应贴住同一个 S*）")

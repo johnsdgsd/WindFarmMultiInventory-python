@@ -35,8 +35,8 @@ def out_state(Ly, x_in, rec) -> np.ndarray:
 
 
 def F_of(prob, Ly, x_in, scene) -> np.ndarray:
-    """失效台数 F = ⌊θ·n⌋（与 Fdef 两式定义一致）。"""
-    return np.floor(np.asarray(scene[1], float) * Ly.n(x_in))
+    """失效台数 F = rint(θ·n)（与 subproblem.py 的 Fdef 两式定义一致）。"""
+    return np.rint(np.asarray(scene[1], float) * Ly.n(x_in))
 
 
 def cost_terms(prob, Ly, x_in, rec) -> np.ndarray:
@@ -61,10 +61,10 @@ def check_stage(prob, Ly, x, xo, q_out, taup, taum, S, y, scene_idx, ub) -> dict
     参数全部是**数组**（不是 worker 的 rec 字典），这样 `simulate.py`（手上有 rec）
     与 `analyze_sim.py`（手上有 npz）能共用同一份判据。
 
-    **F 的判据不能用 `floor(θ·n)` 硬比**：模型那条约束是 `θn − 1 ≤ F ≤ θn`、`F ∈ ℤ`，
-    当 `θn` 落在整数上方 FeasTol(1e-6) 以内时（实测 4 / 6e7 个等式），求解器允许 F 取
-    整数边界下方那一档。所以这里**从 age 行反解出模型自己的 F**，再查它是否落在
-    `[θn − 1, θn]` 区间内（含容差）—— 这才是模型的真实约束。
+    **F 的判据不能拿取整函数硬比**：模型那条约束是 `θn − 0.5 ≤ F ≤ θn + 0.5`、`F ∈ ℤ`
+    （⇒ `F = rint(θn)`），当 `θn` 落在半整数附近 FeasTol(1e-6) 以内时，求解器允许 F 取
+    边界另一侧那一档。所以这里**从 age 行反解出模型自己的 F**，再查它是否落在
+    `[θn − 0.5, θn + 0.5]` 区间内（含容差）—— 这才是模型的真实约束。
     """
     NR, A, L = Ly.N_R, Ly.A, Ly.L
     n_in, I_in, o_in, q_in = Ly.n(x), Ly.I(x), Ly.o(x), Ly.q(x)
@@ -80,7 +80,7 @@ def check_stage(prob, Ly, x, xo, q_out, taup, taum, S, y, scene_idx, ub) -> dict
     # 模型自己的 F：a ≤ A−2 从 age 行反解；A−1 无 age 行，只能按定义重算
     F = np.empty((NR, A))
     F[:, :A - 1] = n_in[:, :A - 1] - n_out[:, 1:]
-    F[:, A - 1] = np.floor(th[:, A - 1] * n_in[:, A - 1])
+    F[:, A - 1] = np.rint(th[:, A - 1] * n_in[:, A - 1])
     o_out = np.empty_like(o_in)
     for l in range(L - 2):
         o_out[l] = o_in[l + 1]
@@ -91,8 +91,8 @@ def check_stage(prob, Ly, x, xo, q_out, taup, taum, S, y, scene_idx, ub) -> dict
         "pas": np.maximum(y.sum(axis=0) - I_in, 0).max(),
         "dem": np.maximum(y.sum(axis=1) + n_in.sum(axis=1) - F.sum(axis=1) - prob.N, 0).max(),
         "age0": np.abs(n_out[:, 0] - y.sum(axis=1)).max(),
-        "F定义": max(float(np.maximum(prod - 1.0 - F, 0).max()),
-                    float(np.maximum(F - prod, 0).max())),
+        "F定义": max(float(np.maximum(prod - 0.5 - F, 0).max()),
+                    float(np.maximum(F - prod - 0.5, 0).max())),
         "send_def": np.abs(S - (I_in - y.sum(axis=0) + o_in[0])).max(),
         "tau_bal": abs(tau.sum()),
         "tau_lo": np.maximum(-(S + tau), 0).max(),
