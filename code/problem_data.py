@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from .config import ProblemConfig
 from .state_layout import StateLayout
 
 COV_NAMES = ("mu_T", "sigma_T", "lambda", "alpha_L", "beta_L")
@@ -168,55 +169,21 @@ def pool_mean_p(pool, h0, beta_cov, z_bar, N_R, A) -> np.ndarray:
     return p_bar / len(pool)
 
 
-def DefineProblem(*, T: int = 24, A: int = 120, N_R: int = 5, L: int = 2,
-                  pool_size: int = 300, seed: int = 2026,
-                  C: float = 50.0, h: float = 1.0, Cs: float = 200.0,
-                  atc: float = 5.0, tc: float = 10.0,
-                  m: float = 2.5, eta: float = 120.0, a_beta: float = 2.0,
-                  beta_cov=(0.015, 0.025, 0.010),
-                  z_bar=(60.0, 5.0, 65.0),
-                  cov_mu_T: float = 60.0, cov_sigma_T: float = 4.0,
-                  cov_lambda: float = 5.0,
-                  cov_alpha_L: float = 7.8, cov_beta_L: float = 4.2,
-                  spread_init: bool = False,
-                  priority: dict | None = None,
-                  N=None, Qmax=None, Imax=None) -> ProblemData:
-    """构造问题数据并自检。`spread_init=True` 把期初月龄摊平（冒烟用）。"""
-    # ---- 维度校验（报错带具体数值）----
-    if T <= 0:
-        raise ValueError(f"T 必须为正，实际 {T}")
-    if A <= 1:
-        raise ValueError(f"A 必须大于 1，实际 {A}")
-    if N_R <= 0:
-        raise ValueError(f"N_R 必须为正，实际 {N_R}")
-    if L < 2:
-        raise ValueError(f"当前实现要求 L ≥ 2（在途管 L−1 ≥ 1），实际 {L}")
-    if m < 1:
-        raise ValueError(f"威布尔形状参数 m 必须 ≥ 1（m<1 时 h0(0)=∞），实际 {m}")
-    if eta <= 0:
-        raise ValueError(f"威布尔尺度参数 η 必须为正，实际 {eta}")
-    if pool_size < 2:
-        raise ValueError(f"pool_size 至少为 2，实际 {pool_size}")
-    beta_cov = np.asarray(beta_cov, dtype=float)
-    z_bar = np.asarray(z_bar, dtype=float)
-    if beta_cov.size != 3 or z_bar.size != 3:
-        raise ValueError(f"PHM 要求 3 维协变量，实际 beta_cov={beta_cov}、z_bar={z_bar}")
-    if cov_sigma_T <= 0 or cov_lambda <= 0 or cov_alpha_L <= 0 or cov_beta_L <= 0:
-        raise ValueError(f"协变量分布参数必须为正：σ={cov_sigma_T}, λ={cov_lambda}, "
-                         f"α_L={cov_alpha_L}, β_L={cov_beta_L}")
+def DefineProblem(cfg: ProblemConfig) -> ProblemData:
+    """从 ProblemConfig 构造问题数据。参数校验全在 ProblemConfig 里（code/config.py）。"""
+    T, A, N_R, L = cfg.T, cfg.A, cfg.N_R, cfg.L
+    N = np.asarray(cfg.N, dtype=np.int64)
+    Qmax = np.asarray(cfg.Qmax, dtype=np.int64)
+    Imax = np.asarray(cfg.Imax, dtype=np.int64)
+    beta_cov = np.asarray(cfg.beta_cov, dtype=float)
+    z_bar = np.asarray(cfg.z_bar, dtype=float)
+    cov = dict(cfg.cov)
 
-    priority = default_priority(N_R) if priority is None else priority
-    if sorted(priority.keys()) != list(range(1, N_R + 1)):
-        raise ValueError(f"priority 表须恰覆盖仓库 1..N_R（N_R={N_R}）")
-    tc_route = make_tc_route(priority, tc, N_R)
+    priority = default_priority(N_R) if cfg.priority is None else cfg.priority
+    tc_route = make_tc_route(priority, cfg.tc, N_R)
 
-    # ---- 机队与初值 ----
-    N = np.array([10000, 8000, 5000, 12000, 3000][:N_R], dtype=np.int64) if N is None \
-        else np.asarray(N, dtype=np.int64)
-    if N.size != N_R:
-        raise ValueError(f"N 长度 {N.size} ≠ N_R={N_R}")
     n0 = np.zeros((N_R, A), dtype=np.int64)
-    if spread_init:
+    if cfg.spread_init:
         for r in range(N_R):                      # 每仓独立摊平（异质机队）
             base, rem = divmod(int(N[r]), A)
             n0[r, :] = base
@@ -225,15 +192,8 @@ def DefineProblem(*, T: int = 24, A: int = 120, N_R: int = 5, L: int = 2,
         n0[:, 0] = N
     I0 = np.zeros(N_R, dtype=np.int64)
     o0 = np.zeros((L - 1, N_R), dtype=np.int64)
-    Qmax = np.array([300, 100, 200, 1000, 150][:N_R], dtype=np.int64) if Qmax is None \
-        else np.asarray(Qmax, dtype=np.int64)
-    Imax = np.array([1000, 400, 500, 2000, 300][:N_R], dtype=np.int64) if Imax is None \
-        else np.asarray(Imax, dtype=np.int64)
-    cov = {"mu_T": float(cov_mu_T), "sigma_T": float(cov_sigma_T),
-           "lambda": float(cov_lambda), "alpha_L": float(cov_alpha_L),
-           "beta_L": float(cov_beta_L)}
 
-    h0 = np.array([weibull_hazard(a, m, eta) for a in range(A)])
+    h0 = np.array([weibull_hazard(a, cfg.m, cfg.eta) for a in range(A)])
 
     for r in range(N_R):
         if int(n0[r].sum()) != int(N[r]):
@@ -241,14 +201,16 @@ def DefineProblem(*, T: int = 24, A: int = 120, N_R: int = 5, L: int = 2,
         if I0[r] > Imax[r]:
             raise ValueError(f"仓库 {r+1} 期初库存 {I0[r]} 超过容量 Imax={Imax[r]}")
 
-    pool = sample_pool(h0, beta_cov, z_bar, cov, N_R, A, pool_size, seed)
+    pool = sample_pool(h0, beta_cov, z_bar, cov, N_R, A, cfg.pool_size, cfg.seed)
     p_bar = pool_mean_p(pool, h0, beta_cov, z_bar, N_R, A)
 
     return ProblemData(T=T, A=A, N_R=N_R, L=L, N=N, n0=n0, I0=I0, o0=o0,
-                       C=C, h=h, Cs=Cs, atc=atc, tc=tc, Qmax=Qmax, Imax=Imax,
+                       C=cfg.C, h=cfg.h, Cs=cfg.Cs, atc=cfg.atc, tc=cfg.tc,
+                       Qmax=Qmax, Imax=Imax,
                        priority=priority, tc_route=tc_route,
-                       m=m, eta=eta, a_beta=a_beta, beta_cov=beta_cov, z_bar=z_bar,
-                       cov=cov, h0=h0, p_bar=p_bar, pool=pool, seed=seed,
+                       m=cfg.m, eta=cfg.eta, a_beta=cfg.a_beta,
+                       beta_cov=beta_cov, z_bar=z_bar,
+                       cov=cov, h0=h0, p_bar=p_bar, pool=pool, seed=cfg.seed,
                        layout=StateLayout(N_R, A, L))
 
 

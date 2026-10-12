@@ -1,26 +1,21 @@
 # run.py — 唯一训练入口。路径全部由 __file__ 推导，在任何目录下都能跑。
 #
-#   python run.py                              # 全部用 main 的默认值
-#   python run.py 500                          # 训练 500 轮（仿真路径数仍用默认）
-#   python run.py 500 300                      # 训练 500 轮 + 仿真 300 路径
-#   python run.py smoke                        # 冒烟：小实例快跑，验证链路连通
-#   python run.py 200 resume results/base_20261008_120000    # 续训 200 轮
+#   python run.py                                   # 用 config/ 的配置
+#   python run.py --config-dir config/smoke         # 换一套配置
+#   python run.py 300                               # 覆盖轮数（其余仍走配置）
+#   python run.py 300 2000                          # 覆盖轮数 + 仿真路径数
+#   python run.py --config-dir config/smoke 20      # 冒烟配置 + 覆盖轮数
+#   python run.py 200 resume results/<目录>          # 续训
 #
-# 求解器默认 COPT_DLL；命令行加一个位置参数 "cbc" 即改用 CBC，位置不限：
-#   python run.py smoke cbc                    # 冒烟 + CBC
-#   python run.py 500 cbc                      # 训练 500 轮 + CBC
-#   python run.py 200 resume results/<目录> cbc   # 续训 + CBC
-# 求解器写进 config.txt 的 solver= 字段（copt/cbc），simulate_only 与
-# simulate_inspect 会自动沿用。
+# 参数的唯一事实源是 config/*.toml：默认值只写在那里，代码里没有第二处。
+# 命令行位置参数是**显式覆盖**（覆盖谁就在启动时回显谁），不是默认值。
 #
-# 位置参数只在给了的时候才传给 main，没给就交给 main 的默认值 —— 别在这里写死
-# 200/1000 之类的兜底，那会盖掉 main 里改过的默认值。
-#
-# 训练与仿真走多进程（multiprocessing，Windows 为 spawn）。进程数默认核数，
-# 用 n_processes 覆盖；n_processes=1 时退化为串行，便于调试与 traceback。
+# 训练与仿真走多进程（Windows 为 spawn）。进程数默认物理核数的一半，用
+# [parallel].n_processes 改；n_processes=1 退化为串行，便于调试与 traceback。
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -33,36 +28,54 @@ sys.path.insert(0, str(ROOT))
 sys.stdout.reconfigure(errors="replace")
 sys.stderr.reconfigure(errors="replace")
 
-from code.model import build_stage_subproblem                      # noqa: E402
+# 卡死排查开关：设 SDDP_STACK_AFTER=<秒> 后，若 N 秒内没跑完就打印所有线程的调用栈
+# 再退出。程序"看起来卡住"时用它一次定位到阻塞点（多进程下 worker 的栈要各自 dump）。
+_stack_after = os.environ.get("SDDP_STACK_AFTER")
+if _stack_after:
+    import faulthandler
+    faulthandler.enable()
+    faulthandler.dump_traceback_later(float(_stack_after), exit=True)
+    print(f"[调试] {_stack_after} s 后会打印全部线程栈并退出")
+
+from code.config import load_problem_config, load_solver_config     # noqa: E402
 from code.problem_data import DefineProblem, print_summary, to_json  # noqa: E402
-from utils import SDDPEngine, simulate                             # noqa: E402
-from utils.io import (archive_log, load_cuts, new_run_dir, read_config,  # noqa: E402
-                      save_json, save_summary, write_config)
+from code.subproblem import make_stage_subproblem                   # noqa: E402
+from utils import SDDPEngine, simulate                              # noqa: E402
+from utils.io import (archive_log, has_configs, load_cuts, new_run_dir,  # noqa: E402
+                      problem_diff, save_json, save_summary, write_configs)
 
-RESULTS_ROOT = str(ROOT / "results")
+
+def _load(config_dir: Path):
+    return (load_problem_config(config_dir / "problem.toml"),
+            load_solver_config(config_dir / "solver.toml"))
 
 
-def main(*, iterations: int = 200, n_simulations: int = 10000, pool_size: int = 300,
-         T: int = 200, A: int = 120, N_R: int = 5, L: int = 2, seed: int = 2026,
-         m: float = 2.5, eta: float = 120.0, n_forward_paths: int = 120,
-         n_backward_samples: int | None = None, chunk_size: int = 1000,
-         tag: str = "base", smoke: bool = False, n_processes: int | None = 12,
-         checkpoint_interval: float = 600.0, resume_dir: str | None = None,
-         results_root: str = RESULTS_ROOT, use_copt: bool = True):
-    spread_init = False
-    if smoke:
-        # 短寿命 + 月龄摊平：让失效/到寿/调拨/订货链路在少数几期内全部被激活
-        T, pool_size, iterations = 4, 30, 10
-        A, n_simulations, tag = 24, 50, "smoke"
-        m, eta, spread_init, n_forward_paths = 3.0, 8.0, True, 2
-        print("=" * 64)
-        print(f"冒烟模式：T = {T}, A = {A}, pool_size = {pool_size}, "
-              f"iterations = {iterations}, n_simulations = {n_simulations}, "
-              f"m = {m}, η = {eta}")
-        print("=" * 64)
+def main(*, config_dir: str = "config", iterations: int | None = None,
+         n_simulations: int | None = None, resume_dir: str | None = None) -> Path:
+    cdir = Path(config_dir)
+    if not cdir.is_absolute():
+        cdir = ROOT / cdir
+    pcfg, scfg = _load(cdir)
 
-    prob = DefineProblem(T=T, A=A, N_R=N_R, L=L, pool_size=pool_size, seed=seed,
-                         m=m, eta=eta, spread_init=spread_init)
+    print("=" * 66)
+    print(f"生效配置（来自 {cdir}）")
+    print("=" * 66)
+    print(f"问题   T={pcfg.T}  A={pcfg.A}  N_R={pcfg.N_R}  L={pcfg.L}  "
+          f"池={pcfg.pool_size}  m={pcfg.m}  eta={pcfg.eta}")
+    print(scfg.describe())
+
+    overrides = []
+    if iterations is not None:
+        overrides.append(f"iterations: {scfg.iterations} → {iterations}")
+        scfg.iterations = int(iterations)
+    if n_simulations is not None:
+        overrides.append(f"n_simulations: {scfg.n_simulations} → {n_simulations}")
+        scfg.n_simulations = int(n_simulations)
+    if overrides:
+        print("命令行覆盖：" + "；".join(overrides))
+    print("=" * 66)
+
+    prob = DefineProblem(pcfg)
     print_summary(prob)
 
     t0 = time.time()
@@ -70,68 +83,60 @@ def main(*, iterations: int = 200, n_simulations: int = 10000, pool_size: int = 
         d = Path(resume_dir)
         if not d.is_absolute():
             d = ROOT / d
+        if not has_configs(d):
+            raise SystemExit(f"{d} 里没有 config/problem.toml，不是本版本的结果目录，"
+                             f"无法续训")
+        rpcfg, _ = _load(d / "config")
+        diff = problem_diff(rpcfg, pcfg)
+        if diff:
+            raise SystemExit(
+                f"问题配置与结果目录不一致（{', '.join(diff)}）——模型已变，旧割不再"
+                f"兼容（铁律 4），必须换新目录全新训练")
     else:
-        d = new_run_dir(tag, results_root)
+        d = new_run_dir(scfg.tag, str(ROOT / scfg.results_root))
         print(f"结果目录：{d}")
+        write_configs(d, cdir / "problem.toml", cdir / "solver.toml")
+        save_json(d, "problem_data.json", to_json(prob))
 
     # 工作进程在建池时装配 results_dir（求解失败要往那里导出现场 LP），
     # 所以目录必须先定下来再建引擎。
-    if not use_copt:
-        print("求解器：CBC（COPT_DLL 关闭）")
-    eng = SDDPEngine(
-        prob, build_stage_subproblem, T=prob.T, state_dim=prob.state_dim,
-        initial_state=prob.initial_state(), n_processes=n_processes, seed=seed,
-        results_dir=d, checkpoint_interval=checkpoint_interval,
-        use_copt=use_copt)
+    eng = SDDPEngine(prob, make_stage_subproblem, scfg, results_dir=d, log=print)
     start_iter = 1
     try:
         if resume_dir is not None:
             cuts, meta = load_cuts(d, prob.T, prob.state_dim)
             eng.cuts = cuts
-            start_iter = int(read_config(d).get("iterations", 0) or 0) + 1
+            start_iter = int(meta.get("n_iterations", 0)) + 1
             archive_log(d)
             print(f"续训：从 {d} 读回 {sum(len(c) for c in cuts)} 条割，"
                   f"起始轮次 {start_iter}（重启下界 = {eng.lower_bound():.4f}）")
+            write_configs(d, cdir / "problem.toml", cdir / "solver.toml")
 
-        write_config(d, [
-            ("tag", tag), ("iterations", iterations), ("pool_size", pool_size),
-            ("T", T), ("A", A), ("N_R", N_R), ("L", L), ("seed", seed),
-            ("spread_init", spread_init), ("n_forward_paths", n_forward_paths),
-            ("n_backward_samples", "all" if n_backward_samples is None
-             else n_backward_samples),
-            ("C", prob.C), ("h", prob.h), ("Cs", prob.Cs),
-            ("atc", prob.atc), ("tc", prob.tc),
-            ("m", prob.m), ("eta", prob.eta), ("a_beta", prob.a_beta),
-            ("beta_cov", list(np.asarray(prob.beta_cov).round(6))),
-            ("z_bar", list(np.asarray(prob.z_bar).round(6))),
-            ("N", list(np.asarray(prob.N).astype(int))),
-            ("Qmax", list(np.asarray(prob.Qmax).astype(int))),
-            ("Imax", list(np.asarray(prob.Imax).astype(int))),
-            ("solver", "copt" if use_copt else "cbc"),
-        ])
-        save_json(d, "problem_data.json", to_json(prob))
-
-        # 逐轮回调里写日志：引擎只在 verbose 时打印，这里统一由本脚本落 CSV + 终端
         log = eng.open_log()
 
         def on_iter(rec):
             log.row(rec["iter"], rec["sim"], rec["lb"], rec["time"], rec["solves"])
+            fb = rec.get("mip_fallback", 0)
+            note = f" | MIP 近似 {fb}" if fb else ""
+            nd = rec.get("n_dropped", 0)
+            if nd:
+                note += f" | 已筛除 {nd}"
             print(f"  轮 {rec['iter']:5d} | LB = {rec['lb']:14.4f} | "
                   f"前向均值 = {rec['sim']:14.4f} | 割数 = {rec['n_cuts']:6d} | "
-                  f"{rec['time']:7.1f} s")
+                  f"{rec['time']:7.1f} s{note}")
 
         eng.on_iter = on_iter
-        hist = eng.train(iterations, n_forward_paths=n_forward_paths,
-                         n_backward_samples=n_backward_samples,
-                         start_iter=start_iter, verbose=False)
+        hist = eng.train(scfg.iterations, start_iter=start_iter, verbose=False,
+                         trace=bool(os.environ.get("SDDP_TRACE")))
         log.close()
 
         lb = eng.lower_bound()
         print(f"训练完成：{len(hist)} 轮，用时 {time.time() - t0:.1f} s，"
               f"累计求解 {eng.n_solves} 次，LB = {lb:.4f}")
 
-        print(f"仿真 {n_simulations} 条路径（chunk = {chunk_size}）…")
-        st = simulate(eng, n_paths=n_simulations, seed=seed, chunk_size=chunk_size)
+        print(f"仿真 {scfg.n_simulations} 条路径（chunk = {scfg.chunk_size}）…")
+        st = simulate(eng, n_paths=scfg.n_simulations, seed=scfg.seed,
+                      chunk_size=scfg.chunk_size)
         ub, ci = st.mean, st.ci95
         gap = (ub - lb) / abs(ub) * 100 if ub else float("nan")
         print(f"UB = {ub:.4f} ± {ci:.4f}（95%），gap = {gap:.2f}%")
@@ -162,20 +167,22 @@ def main(*, iterations: int = 200, n_simulations: int = 10000, pool_size: int = 
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    use_cbc = "cbc" in args
-    if use_cbc:
-        args = [a for a in args if a != "cbc"]
-    if args and args[0] == "smoke":
-        main(smoke=True, use_copt=not use_cbc)
-    elif len(args) >= 2 and args[1] == "resume":
-        if len(args) < 3:
-            raise SystemExit("resume 需指定结果目录：python run.py 200 resume results/<目录名>")
-        main(iterations=int(args[0]), resume_dir=args[2], tag=Path(args[2]).name,
-             use_copt=not use_cbc)
-    elif not args:
-        main(use_copt=not use_cbc)
-    elif len(args) == 1:
-        main(iterations=int(args[0]), use_copt=not use_cbc)
-    else:
-        main(iterations=int(args[0]), n_simulations=int(args[1]),
-             use_copt=not use_cbc)
+    kw = {}
+    if "--config-dir" in args:
+        i = args.index("--config-dir")
+        if i + 1 >= len(args):
+            raise SystemExit("--config-dir 需要一个路径参数")
+        kw["config_dir"] = args[i + 1]
+        args = args[:i] + args[i + 2:]
+    if "resume" in args:
+        i = args.index("resume")
+        if i + 1 >= len(args):
+            raise SystemExit("resume 需指定结果目录：python run.py [轮数] resume results/<目录>")
+        kw["resume_dir"] = args[i + 1]
+        if i > 0:
+            kw["iterations"] = int(args[0])
+    elif len(args) >= 1:
+        kw["iterations"] = int(args[0])
+        if len(args) >= 2:
+            kw["n_simulations"] = int(args[1])
+    main(**kw)

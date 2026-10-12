@@ -1,79 +1,100 @@
-# 子问题层自检：单期求解 + 对偶提取四项（.dj vs π、次梯度不等式、转移残差、割合法性）。
+# 对偶自检四项：.dj vs 通用式、次梯度不等式、割合法性、平凡割合法性。
 #   python test/_t_smoke.py
+#
+# 判据是**次梯度不等式**而不是中心差分：折点处中心差分给的是左右斜率均值，它只是
+# 一个合法次梯度，判不出真伪（见 utils/diagnostics.py 顶部说明）。
+
 import sys
 from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.stdout.reconfigure(errors="replace")
 
-from code.problem_data import DefineProblem          # noqa: E402
-from code.model import build_stage_subproblem        # noqa: E402
-from utils import Cut, make_solver, trivial_cut      # noqa: E402
-from utils import diagnostics as dg                  # noqa: E402
+from code.config import load_problem_config, load_solver_config   # noqa: E402
+from code.problem_data import DefineProblem                       # noqa: E402
+from code.subproblem import make_stage_subproblem                 # noqa: E402
+from utils import Cut, trivial_cut                                # noqa: E402
+from utils import diagnostics as dg                               # noqa: E402
 
-prob = DefineProblem(T=4, A=24, N_R=3, pool_size=30, spread_init=True,
-                     m=3.0, eta=8.0)
+prob = DefineProblem(load_problem_config(ROOT / "config/smoke/problem.toml"))
+scfg = load_solver_config(ROOT / "config/smoke/solver.toml")
 Ly = prob.layout
-print(f"T={prob.T} A={prob.A} N_R={prob.N_R} dim={Ly.dim} pool={len(prob.pool)}")
-x0 = prob.initial_state()
-n0 = Ly.n(x0)
-print("x0: I 合计 =", Ly.I(x0).sum(), " o 合计 =", Ly.o(x0).sum(),
-      " q =", Ly.q(x0), " n 合计 =", n0.sum(), " N 合计 =", float(np.sum(prob.N)))
-print("x0 月龄分布(仓0) =", n0[0][:12].astype(int), "...")
+rng = np.random.default_rng(4242)
 
-smip = make_solver(mip=True)
-slp = make_solver(mip=False)
+ROWS = []
 
-# ---- 构造内部状态（各分量都离边界 > 1）----
-xs = x0.copy()
-Iv = Ly.I(xs); Iv[:] = [30.0, 20.0, 15.0]
-ov = Ly.o(xs); ov[:] = 4.0
-qv = Ly.q(xs); qv[:] = 2.0
-nv = Ly.n(xs)
-mv = int(nv[1, 0] * 0.3); nv[1, 0] -= mv; nv[1, 7] += mv
-print("内部状态: I=", Ly.I(xs), " o=", Ly.o(xs), " q=", Ly.q(xs),
-      " n 合计 =", Ly.n(xs).sum())
 
-scene = prob.pool[3]
-triv = trivial_cut(stage=2, state=xs, dim=Ly.dim)
-cuts_next = ([triv.alpha], triv.beta.reshape(1, -1))
+def check(name, ok, note=""):
+    ROWS.append((name, "PASS" if ok else "FAIL", note))
 
-# ---- 虚拟首阶段：无割（纯常量目标）----
-sub0 = build_stage_subproblem(0, x0, None, None, prob).solve(smip)
-print("t=0 obj =", sub0.obj, " q_out =", [round(v, 3) for v in sub0.decision_values()["q"]])
 
-# ---- 真实期 ----
-for x, tag in ((x0, "初值"), (xs, "内部")):
-    sub = build_stage_subproblem(1, x, scene, cuts_next, prob).solve(smip)
-    dv = sub.decision_values()
-    print(f"[{tag}] t=1 obj={sub.obj:.4f} stage_cost={sub.stage_cost():.4f} "
-          f"tau+={dv['taup']} tau-={dv['taum']} S_end={[round(v,2) for v in dv['S_end']]}")
-    print(f"      q_out={dv['q']}  被动 y 合计={np.sum(dv['y']):.2f}  I_out={np.round(dv['I_out'],2)}")
+x0 = dg.probe_states(rng, prob, n=1)[0]
+scene = prob.pool[5]
 
-# ---- 对偶提取自检（内部状态）----
-r1 = dg.dual_crosscheck(build_stage_subproblem, prob, slp, 1, xs, scene, cuts_next)
-print("① dj vs duals:", {k: (round(v, 8) if isinstance(v, float) else v) for k, v in r1.items()})
+print("=" * 78)
+print("§1 无割：.dj 与通用式 c_s + Σa_c·π_c 交叉验证")
+print("=" * 78)
+r = dg.dual_crosscheck(make_stage_subproblem, prob, scfg, 2, x0, scene, None)
+print(f"  Q = {r['Q']:.6f}  最大相对偏差 = {r['max_rel_err']:.3e}  "
+      f"非零梯度维数 = {r['n_nonzero_beta']}")
+check("无割交叉验证", r["ok"], f"rel={r['max_rel_err']:.2e}")
 
-comps = [Ly.ix_I(0), Ly.ix_n(1, 5), Ly.ix_n(2, 0), Ly.ix_q(2), Ly.ix_o(0, 1),
-         Ly.ix_n(0, 23)]
-r2 = dg.subgradient_inequality(build_stage_subproblem, prob, slp, 1, xs, scene,
-                               cuts_next, comps)
-print(f"② 次梯度不等式：checked={r2['n_checked']} skipped={r2['n_skipped']} ok={r2['ok']}")
-for row in r2["rows"]:
-    print("   ", {k: (round(v, 8) if isinstance(v, float) else v) for k, v in row.items()})
+print()
+print("=" * 78)
+print("§2 带割：交叉验证")
+print("=" * 78)
+cuts = (np.array([0.0]), np.zeros((1, Ly.dim)))
+r2 = dg.dual_crosscheck(make_stage_subproblem, prob, scfg, 2, x0, scene, cuts)
+print(f"  Q = {r2['Q']:.6f}  最大相对偏差 = {r2['max_rel_err']:.3e}")
+check("带割交叉验证", r2["ok"], f"rel={r2['max_rel_err']:.2e}")
 
-# ---- 状态转移一致性：n_out[a+1] = n_in[a] − F[a] ----
-F = np.rint(scene[1] * Ly.n(xs)).astype(int)
-nout = Ly.n(sub.out_state_vector())
-print("③ 月龄转移残差 max =", int(np.abs(nout[:, 1:] - (Ly.n(xs)[:, :-1] - F[:, :-1])).max()))
-print("   库存动态残差 max =", float(np.abs(Ly.I(sub.out_state_vector())
-      - (np.asarray(dv["S_end"]) + np.asarray(dv["taup"]) - np.asarray(dv["taum"]))).max()))
-print("   需求约束松弛 =", [round(sub.prob.constraints[f"dem_{r}"].value(), 4)
-                           for r in range(prob.N_R)])
+print()
+print("=" * 78)
+print("§3 次梯度不等式（逐分量左右差商夹逼）")
+print("=" * 78)
+comps = [Ly.ix_I(0), Ly.ix_n(0, 3), Ly.ix_q(1), Ly.ix_o(0, 2)]
+g = dg.subgradient_inequality(make_stage_subproblem, prob, scfg, 2, x0, scene,
+                              None, comps, h=1e-3)
+for row in g["rows"]:
+    fmt = lambda v: "None" if v is None else f"{v:12.6f}"     # noqa: E731
+    print(f"  分量 {row['j']:3d}  β={row['beta']:12.6f}  "
+          f"左={fmt(row['left'])}  右={fmt(row['right'])}  "
+          f"{'OK' if row['ok'] else 'BAD'} {row['why']}")
+check("次梯度不等式", g["ok"], f"{g['n_checked']} 检查 / {g['n_skipped']} 跳过")
 
-# ---- 割的合法性 ----
-rng = np.random.default_rng(0)
-cut = Cut(alpha=0.0, beta=np.zeros(Ly.dim), state=xs, stage=1, obj=0.0, it=0)
-probes = dg.probe_states(rng, prob, n=3)
-print("3b 平凡割合法性:", dg.cut_validity(build_stage_subproblem, prob, slp, cut, probes, cuts_next, scene))
+print()
+print("=" * 78)
+print("§4 割的全局合法性：α + β·(s − x̄) ≤ Q(s)")
+print("=" * 78)
+sub = make_stage_subproblem(2, prob, scfg)
+sub.assemble(None)
+sub.set_point(x0, scene)
+sub.solve_lp()
+beta = sub.gradient("dj").copy()
+cut = Cut(sub.obj - float(beta @ x0), beta, x0.copy(), 2, sub.obj, 0)
+probes = dg.probe_states(rng, prob, n=4, scale=0.8)
+cv = dg.cut_validity(make_stage_subproblem, prob, scfg, cut, probes, None, scene)
+print(f"  探测 4 点，最小间隙 = {cv['min_slack']:.6f}（显著为负即割越界）")
+check("割合法性", cv["ok"], f"min_slack={cv['min_slack']:.3e}")
+
+print()
+print("=" * 78)
+print("§5 平凡割 θ ≥ 0 合法（目标非负 ⇒ V ≥ 0）")
+print("=" * 78)
+tc = trivial_cut(2, x0, Ly.dim)
+cv2 = dg.cut_validity(make_stage_subproblem, prob, scfg, tc, probes, None, scene)
+print(f"  最小间隙 = {cv2['min_slack']:.6f}")
+check("平凡割合法", cv2["ok"], f"min_slack={cv2['min_slack']:.3e}")
+
+print()
+print("=" * 78)
+print("汇总")
+print("=" * 78)
+n_fail = sum(1 for r_ in ROWS if r_[1] == "FAIL")
+for name, st, note in ROWS:
+    print(f"  [{st}] {name}   {note}")
+print(f"  {len(ROWS) - n_fail}/{len(ROWS)} 通过")
+sys.exit(1 if n_fail else 0)

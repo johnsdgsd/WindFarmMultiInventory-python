@@ -1,12 +1,16 @@
 # io.py — 结果目录、配置、割文件与训练日志的读写。与问题解耦，可整目录迁移。
-"""结果目录约定（与 Julia 版一致）：
+"""结果目录约定：
 
     results/<tag>_<yyyymmdd_HHMMSS>/
-        config.txt             key=value，结果目录自描述
+        config/problem.toml    生效问题配置（原样拷贝，注释与结构全保留）
+        config/solver.toml     生效求解配置
         problem_data.json      问题数据（含预采样场景池）
         cuts.json              Benders 割（Cut 的完整记录）
         sddp_training_log.csv  训练日志（空格分隔，兼容 plot/plot_bounds.py）
         summary_<时间戳>.txt   下界/上界/间隙报表
+
+配置落盘用的是**拷贝源文件**而不是重新序列化：注释和分组全保留，结果目录自描述，
+且读回时用同一套 loader（`code.config.load_all(结果目录)`）。
 
 只新增、不覆盖：训练与仿真只往结果目录里写新文件，或先写 .tmp 再原子改名。
 """
@@ -15,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -24,6 +29,9 @@ from .cut import FORMAT_VERSION, Cut
 
 LOG_HEADER = (" iteration    simulation      bound        time (s)"
               "     solves  pid")
+
+PROBLEM_TOML = "problem.toml"
+SOLVER_TOML = "solver.toml"
 
 
 def timestamp() -> str:
@@ -38,15 +46,22 @@ def new_run_dir(tag: str, root) -> Path:
 
 
 # --------------------------------------------------------------------- 配置
-def write_config(d, pairs) -> Path:
-    path = Path(d) / "config.txt"
-    with open(path, "w", encoding="utf-8") as f:
-        for k, v in pairs:
-            f.write(f"{k}={v}\n")
-    return path
+def write_configs(d, problem_src, solver_src) -> Path:
+    """把生效的 TOML 原样拷进 <d>/config/。返回该目录。"""
+    out = Path(d) / "config"
+    out.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(problem_src, out / PROBLEM_TOML)
+    shutil.copyfile(solver_src, out / SOLVER_TOML)
+    return out
+
+
+def has_configs(d) -> bool:
+    return (Path(d) / "config" / PROBLEM_TOML).is_file() and \
+           (Path(d) / "config" / SOLVER_TOML).is_file()
 
 
 def read_config(d) -> dict:
+    """读旧式 config.txt（仅有历史结果目录会命中；返回 {} 表示没有）。"""
     path = Path(d) / "config.txt"
     if not path.is_file():
         return {}
@@ -57,6 +72,24 @@ def read_config(d) -> dict:
             continue
         k, v = line.split("=", 1)
         out[k.strip()] = v.strip()
+    return out
+
+
+# ------------------------------------------------------- 问题配置一致性校验
+_PROBLEM_KEYS = ("T", "A", "N_R", "L", "N", "Qmax", "Imax", "C", "h", "Cs",
+                 "atc", "tc", "m", "eta", "a_beta", "pool_size", "seed",
+                 "spread_init")
+
+
+def problem_diff(a, b) -> list[str]:
+    """比较两份 ProblemConfig 里**决定模型结构**的字段，返回不同的键名列表。
+
+    改了这些字段就换了问题本身，旧割不再有效（铁律 4），resume 必须先拦住。
+    """
+    out = []
+    for k in _PROBLEM_KEYS:
+        if getattr(a, k) != getattr(b, k):
+            out.append(k)
     return out
 
 
@@ -107,8 +140,17 @@ def save_cuts(d, cuts_by_stage, meta: dict, name: str = "cuts.json") -> Path:
 
 
 def load_cuts(d, t_max: int, dim: int, name: str = "cuts.json") -> tuple[list, dict]:
-    """读回割，返回 (cuts_by_stage, meta)。"""
+    """读回割，返回 (cuts_by_stage, meta)。
+
+    版本不符直接拒收：维度校验只能发现 T/A/N_R 这类变化，**发现不了模型结构改动**
+    （约束写法、参数化方式），而那种改动同样让旧割失效（铁律 4）。
+    """
     payload = load_json(d, name)
+    ver = int(payload.get("version", 0))
+    if ver != FORMAT_VERSION:
+        raise ValueError(
+            f"{Path(d) / name} 的割格式版本 v{ver} ≠ 当前 v{FORMAT_VERSION}"
+            f"（模型结构已改，旧割不兼容 —— 铁律 4：必须全新训练，不要 resume）")
     cuts = [[] for _ in range(t_max + 1)]
     for k, items in payload.get("cuts", {}).items():
         t = int(k)

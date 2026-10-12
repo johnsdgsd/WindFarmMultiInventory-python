@@ -1,0 +1,39 @@
+# 冒烟/自检用的极小问题。格式与 config/problem.toml 完全相同。
+# 短寿命 + 月龄摊平：让失效/到寿/调拨/订货链路在少数几期内全部被激活。
+
+[dimension]
+T = 4
+A = 24
+N_R = 3
+L = 2
+
+[fleet]
+N = [10000, 8000, 5000]
+Qmax = [300, 100, 200]
+Imax = [1000, 400, 500]
+spread_init = true
+
+[cost]
+C = 50.0
+h = 1.0
+Cs = 200.0
+atc = 5.0
+tc = 10.0
+
+[degradation]
+m = 3.0
+eta = 8.0
+a_beta = 2.0
+beta_cov = [0.015, 0.025, 0.010]
+z_bar = [60.0, 5.0, 65.0]
+
+[covariate]
+mu_T = 60.0
+sigma_T = 4.0
+lambda = 5.0
+alpha_L = 7.8
+beta_L = 4.2
+
+[scenario]
+pool_size = 30
+seed = 2026

@@ -13,3 +13,7 @@ results/
 *.sol
 *.bas
 *.log
+
+# 自检脚本的落盘输出（与 *.log 同类，是运行产物不是源码）
+test/_*_out.json
+test/_tmp_iis/

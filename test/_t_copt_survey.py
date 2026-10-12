@@ -18,7 +18,9 @@ import tempfile                                                        # noqa: E
 import coptpy as cp                                                    # noqa: E402
 from coptpy import COPT                                                # noqa: E402
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "test"))
 
 ENV = cp.Envr()
 # COPT 的文件接口走窄字符路径：中文路径 writeLp/write/writeMps/writeBin/setLogFile
@@ -327,17 +329,22 @@ print(f"  resetParam() 后 Threads={m.getParam(COPT.Param.Threads)}  "
 
 # ---------------------------------------------------------------- §8 计时
 head("§8 计时：coptpy 直接建模 vs pulp 建模 + extract + LoadProb")
+# 这一节是**历史对照**：证明重构前那条 pulp 路径慢在哪。生产代码已全走 coptpy，
+# pulp 只在这个计时对照里出现（参照件见 test/_pulp_ref_model.py）。
+import dataclasses                                                     # noqa: E402
 import numpy as np                                                     # noqa: E402
 import pulp                                                            # noqa: E402
 
-from code.model import StageSubproblem                                 # noqa: E402
+from code.config import load_problem_config                            # noqa: E402
 from code.problem_data import DefineProblem                            # noqa: E402
-from utils.solver import make_solver                                   # noqa: E402
+import _pulp_ref_model as pulp_ref                                     # noqa: E402
 
-pd_ = DefineProblem(T=4, A=24, N_R=3, pool_size=10, spread_init=True)
+pd_ = DefineProblem(dataclasses.replace(
+    load_problem_config(ROOT / "config/smoke/problem.toml"),
+    T=4, A=24, N_R=3, pool_size=10, spread_init=True))
 st0 = pd_.initial_state()
-sub = StageSubproblem(1, st0, (None, np.zeros((pd_.N_R, pd_.A))),
-                      None, pd_, 0)
+sub = pulp_ref.StageSubproblem(1, st0, (None, np.zeros((pd_.N_R, pd_.A))),
+                               None, pd_, 0)
 NC = len(sub.prob.variables())
 NR = len(sub.prob.constraints)
 NNZ = sum(len(c) for c in sub.prob.constraints.values())
@@ -358,7 +365,7 @@ t0 = time.perf_counter()
 mc.solveLP()
 t_copt_solve = time.perf_counter() - t0
 
-# (b) pulp 建同规模模型 + COPT_DLL 求解（= 现行路径）
+# (b) pulp 建同规模模型 + COPT_DLL 求解（= 重构前的路径）
 t0 = time.perf_counter()
 pp = pulp.LpProblem("probe", pulp.LpMinimize)
 pv = [pulp.LpVariable(f"q{j}", 0, 1) for j in range(NC)]
@@ -367,7 +374,10 @@ for i in range(NR):
     pp += pv[k] + 0.5 * pv[k + 1] - pv[k + 2] <= 1.0, f"r{i}"
 pp += pulp.lpSum(pv)
 t_pulp_build = time.perf_counter() - t0
-solver = make_solver(mip=False, msg=False)
+import contextlib                                                      # noqa: E402
+import io                                                              # noqa: E402
+with contextlib.redirect_stdout(io.StringIO()):
+    solver = pulp.COPT_DLL(msg=False, mip=False)
 t0 = time.perf_counter()
 pp.solve(solver)
 t_pulp_solve = time.perf_counter() - t0

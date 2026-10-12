@@ -1,0 +1,31 @@
+# 冒烟/自检用的求解参数。格式与 config/solver.toml 完全相同。
+
+[training]
+iterations = 10
+forward_paths_per_process = 1     # 2 进程 × 1 = 2 条前向路径
+n_backward_samples = 0            # 0 = 全枚举（池只有 30 条，够快）
+checkpoint_interval = 600.0
+cut_selection = "lml1"
+cut_select_eps = 1e-6
+cut_select_keep_rounds = 0
+seed = 2026
+
+[parallel]
+n_processes = 2                   # 2 进程：冒烟也走一趟多进程链路
+threads_per_process = 1
+
+[simulation]
+n_simulations = 50
+chunk_size = 25
+
+[numerics]
+feas_tol = 1e-6
+dual_tol = 1e-6
+int_tol = 1e-6
+presolve = -1
+mip_rel_gap = 0.001       # 前向 MIP 相对 gap 容忍（见 config/solver.toml 说明）
+mip_time_limit = 20.0     # 单次 MIP 时限（秒）
+
+[output]
+tag = "smoke"
+results_root = "results"

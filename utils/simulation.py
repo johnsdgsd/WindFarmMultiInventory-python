@@ -2,13 +2,13 @@
 """仿真口径与 Julia 版 simulate_in_chunks 一致：块内结果用完即弃、块种子 = seed+k，
 因此结果依赖 chunk_size（分块只影响随机流切分，不影响统计量口径）。
 每期累加的是**真实单期成本**（不含 theta），长期均值即策略的期望总成本上界。
+
+仿真沿用引擎的前向任务（同一条求解路径），故策略口径与训练前向完全一致。
 """
 
 from __future__ import annotations
 
 import numpy as np
-
-from .training import _path_task
 
 
 class SimStats:
@@ -60,7 +60,6 @@ def simulate(engine, n_paths: int = 1000, seed: int | None = None,
     if n_paths < 1:
         raise ValueError("n_paths 至少为 1")
     base_seed = engine.seed if seed is None else int(seed)
-    cuts_payload = engine._cuts_payload()
     stats = SimStats(engine.T)
 
     done, blk = 0, 0
@@ -69,20 +68,15 @@ def simulate(engine, n_paths: int = 1000, seed: int | None = None,
         rng = np.random.default_rng(base_seed + blk)
         scene_paths = [rng.integers(0, engine.n_scenes, size=engine.T).tolist()
                        for _ in range(n)]
-        tasks = [(cuts_payload, sp, False) for sp in scene_paths]
-        for _, costs, total, _ in engine._map(_path_task, tasks):
+        for _, costs, total, _, _ in engine.forward_paths(scene_paths):
             stats.add(total, costs)
         done += n
         blk += 1
         if verbose:
             engine.log(f"  仿真 {done}/{n_paths}，均值 {stats.mean:.4f}")
-
-    engine.n_solves += n_paths * (engine.T + 1)
     return stats
 
 
 def simulate_paths(engine, scene_paths, record: bool = True):
-    """按给定的场景路径序列仿真，返回原始结果（用于变量检查与个案分析）。"""
-    cuts_payload = engine._cuts_payload()
-    tasks = [(cuts_payload, list(sp), record) for sp in scene_paths]
-    return engine._map(_path_task, tasks)
+    """按给定的场景路径序列仿真，返回原始结果（变量检查与个案分析用）。"""
+    return engine.forward_paths([list(sp) for sp in scene_paths], record=record)

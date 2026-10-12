@@ -13,7 +13,10 @@ from dataclasses import dataclass
 
 import numpy as np
 
-FORMAT_VERSION = 1
+# 割文件结构版本。v1 → v2：失效量 F 由「算成数字写右端」改为「真变量 + Fdef 行定义」
+# （θ 作系数进矩阵）。两版的割**语义不同、不可混用** —— load_cuts 会据此拦下旧目录，
+# 落实铁律 4（模型改过就必须全新训练）。此后任何约束/状态/目标的改动都要再 +1。
+FORMAT_VERSION = 2
 
 
 @dataclass

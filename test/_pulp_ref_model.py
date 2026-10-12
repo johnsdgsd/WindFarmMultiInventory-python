@@ -1,7 +1,9 @@
-# model.py — 单场景子问题。约束编号 (1)..(8) 对应 docs/问题.md §3.3.3。
-"""时序（每期）：被动调拨（只用期初库存，缺货即停机）→ 主动调拨（只用被动调拨后的
-剩余 + 本期到货）→ 调拨后库存经库存动态流入下一期。订货 q 是 here-and-now：
-本期订货在见到本期失效前定下，L−1 期后到货。
+# _pulp_ref_model.py — **历史对照件，不是生产路径**。
+"""这是重构前用 pulp 写的单场景子问题，现只作 `test/_t_equiv.py` 的逐位对照基准：
+证明 coptpy 重写（code/subproblem.py）在 obj / 梯度 / 对偶上与旧实现完全一致。
+生产代码一律走 coptpy，不再 import 本文件。
+
+约束编号 (1)..(8) 对应 docs/问题.md §3.3.3。
 
 对偶提取纪律（SDDP算法Python实现/guide §10.2）：
   · 状态声明为真变量，只用**变量界**锁死在试验点 → 读 .dj 即得 ∂Q/∂x；
@@ -100,10 +102,13 @@ class StageSubproblem:
             self._finish(0.0)
             return
 
-        # ---- 噪声：F[r,a] = round(θ[r,a]·n_in[r,a])，本期失效台数 ----
+        # ---- 噪声：F[r,a] = θ[r,a]·n_in[r,a]，本期失效台数 ----
+        # 与生产口径同步：θ 作系数进矩阵（F 是变量、Fdef 行定义），不能算成数字塞右端，
+        # 否则对偶看不见 ∂F/∂x，割的斜率会缺 θ·∂Q/∂F。此处 pulp 参照件用数值 F，
+        # 但**不取整** —— 取整会让右端带上状态导出的残差常数，等价于退回那个坑。
         theta_s = self.scene[1]
         n_in_val = Ly.n(self.state_vec)
-        F = np.rint(theta_s * n_in_val).astype(np.int64)
+        F = theta_s * n_in_val
 
         # ---- 决策 ----
         cap_sum = float(np.sum(prob.Imax + prob.Qmax))
