@@ -1,5 +1,17 @@
 # CLAUDE.md
 
+> **★ 2026-10-24 当前模型：等级模型（纯 LP）**
+> 4 个运行健康等级 + 失效态 4；Poisson 增量 λ0=0.007；三位小数转移矩阵；
+> 逐行 Dirichlet；`N=Θn`；前向/后向都解 LP；状态维 40（T=240、L=3）；
+> `fleet`/`dem` 右端带 `fleet_tol=1e-6`；状态流转时 n 块 round 6 位，超额
+> ≤`state_repair_tol=1e-4` 从最大分量扣除（不缩放），超过才报错。
+> 模型文档见 `docs/建模与实现.md`。**下文关于月龄/Weibull/Beta/F=rint/
+> 前向 MILP/615/420 的段落是旧模型历史**，代码已按等级模型重写；
+> 旧结果与割 v2/v3/v4 不兼容，当前 `FORMAT_VERSION=5`，不能 resume。
+> 新模型验收：`test/_t_grade_calib.py`、`_t_grade_equiv.py`、`_t_grade_cutvalid.py`；
+> 更新后的 `_t_config/_t_assembly/_t_smoke/_t_sweep/_t_engine/_t_det`；
+> resume 验收：`_t_resume.py`；旧 age/rint/整数测试仅作历史。
+
 风电机队齿轮箱备件的**多仓库库存与调拨**优化：风机按月龄状态退化（威布尔 +
 比例风险），失效形成备件需求；N_R 个仓库共享库存（主动调拨 + 按优先级被动调拨），
 订货有提前期 L。**coptpy 直接建模 + 自研多进程 SDDP 引擎**：前向是 **MILP**（全部
@@ -251,6 +263,21 @@ analyze_sim.py <结果目录>                  # ② 读 npz 分析，秒级，�
 - **COPT 容差默认**：`FeasTol/DualTol/IntTol = 1e-6`、`MatrixTol = 1e-10`、
   `RelGap = 1e-4`/`AbsGap = 1e-6`。实测 FeasTol 边界：冲突量 ≤1e-6 判可行、
   >1e-6 判不可行；`(1−θ)~1e-5` 的系数远在 MatrixTol 安全区内。
+- **★ resume 不恢复 LML1 历史会清空旧割**（2026-10-24）：`cuts.json` 只存 Cut，
+  不存 `_pts/_mx/_rc`；直接 resume 后第一轮 `_lml1_update` 会把所有 `it>0` 的旧割
+  当成无主割删掉。现在 `run.py` resume 调用 `engine.restore_cut_history()`，从每条
+  割的 `state` 和 `alpha,beta` 重建历史。**LML1 的数学逻辑不变**：加载的旧割和
+  新割一样参与筛选（强割支配时旧割仍会被删除），只是不会在第一轮被整体清空。
+  验收 `test/_t_resume.py`。如果以后从别的地方加载 cuts 继续训练，也要先调用这个方法。
+- **★ fleet/dem 的 LP 数值残差**（2026-10-24）：上一期 `n_out` 只满足到 FeasTol，
+  下一期钉死后 `fleet`/`dem` 行会以 1e-6 量级冲突（IIS 实测 3.9e-7，后续又见
+  1.114e-6）。修法分两层：
+  1. `fleet`/`dem` 右端统一为 `N_r + fleet_tol`（默认 1e-6）；
+  2. 状态流转时 n 块按 `state_round_digits=6` 位 round，若仍超 `N_r` 且超额
+     ≤`state_repair_tol=1e-4`，从最大分量中扣除超额（只动一个分量，不缩放）；
+     超过 `state_repair_tol` 才抛错，视为真不可行。
+  **不要用按比例缩放掩盖**——它无法区分真不可行和数值残差。
+  `FORMAT_VERSION=5`，旧割不可用。
 - **★ `trial[t]` 必须是第 t 期的【入库】状态，别记成期末**（2026-10-10）：老代码（含重构前
   的 `training.py`）在 `x = out_state_vector()` **之后**才 `states.append(x)`，于是 `states[k]`
   是第 k+1 期的输出、`trial[t]` 成了第 t+1 期的输入。割会被锚在"下一年"的状态上，而阶段 0
@@ -282,6 +309,7 @@ analyze_sim.py <结果目录>                  # ② 读 npz 分析，秒级，�
 | `_t_sweep.py` | 后向串行扫描验收：T=8 六轮，**断言 LB 在 3 轮内 > 0** |
 | `_t_det.py` | 可复现性边界：第 1 轮割跨进程一致、LB 统计等价、次梯度合法 |
 | `_t_engine.py` | 引擎端到端：割自洽 + 试探点 + 变量记录 + 仿真 |
+| `_t_resume.py` | resume：从 cuts 重建 LML1 历史；弱割不清空旧割，强割仍按 LML1 删除 |
 | `_t_smoke.py` | 对偶自检四项（.dj vs 通用式、次梯度不等式、割合法性）|
 | `_t_iis.py` | 不可行子问题 → 失败兜底导出 LP → 交 AnalysisModel_IIS.py |
 | `_t_solver.py` | coptpy 可用性（LP/MIP/对偶/参数/中文路径落盘）|

@@ -1,4 +1,5 @@
 # simulate_inspect.py — 仿真 + 变量记录：把选定节点的状态/决策写成 CSV 长表，供策略分析。
+# 【LEGACY】旧月龄模型脚本；等级模型请用 simulate.py / analyze_sim.py。
 #
 #   python simulate_inspect.py results/base_20261009_120000 200
 #   python simulate_inspect.py results/base_20261009_120000 200 out.csv

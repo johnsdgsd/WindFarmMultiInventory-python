@@ -1,27 +1,30 @@
-# sim_analysis.py — 仿真结果的**口径定义**：状态重建、五项成本拆解、约束审计。
+# sim_analysis.py — 仿真口径：状态重建、五项成本拆解、等级转移审计。
 #
-# 放 code/（问题侧）而不放 utils/：这些函数直接用 ProblemData 与 StateLayout，
-# 而 utils/ 的纪律是与问题解耦（不 import code/）。simulate.py（落盘）与
-# analyze_sim.py（读盘分析）共用这里的定义，保证两边口径一致。
+# 放 code/（问题侧）而不放 utils/：这些函数直接用 ProblemData 与 StateLayout。
+# simulate.py（落盘）与 analyze_sim.py（读盘分析）共用这里的定义。
+#
+# 等级模型口径：
+#   N = Θ·n（Θ 从场景池取；不落盘，由 n_in + scene 重算）
+#   n_out[0] = Y + N[0,0]；n_out[j] = Σ_i N[i,j]（j≥1）
+#   F_new = Σ_i N[i,G]；W = N_r − Σ_i n_i；W_out = W_in + F_new − Y
+# 纯 LP：不再检查整性，也不再用 age/rint。
 from __future__ import annotations
 
 import numpy as np
 
-# 与 code/subproblem.py 的目标逐项对应
 TERMS = ("采购", "持有", "停机", "主动调拨", "被动调拨")
 
-# 约束审计的核对项（名字对应 subproblem.py 的约束名）
-CHECKS = ("pas", "dem", "age0", "F定义", "send_def", "tau_bal", "tau_lo", "tau_hi",
+CHECKS = ("pas", "fleet", "dem", "grade0", "grade", "N链接", "结构零",
+          "F_new", "W守恒", "send_def", "tau_bal", "tau_lo", "tau_hi",
           "tau_src", "inv", "pipe", "pipe_last", "cap", "界.下", "界.上",
-          "整性", "链.状态")
+          "链.状态")
+
+# 状态流转的 round/repair 会轻微改动 n_out；这三项用 state_repair_tol 审计。
+STATE_NUMERIC_CHECKS = ("grade0", "grade", "W守恒")
 
 
 def out_state(Ly, x_in, rec) -> np.ndarray:
-    """该期期末状态的完整向量，由 x_in 与决策按模型约束唯一确定。
-
-    末期没有下一期状态可借，只能这样重建；其余期与下一期入库状态一致
-    （「链.状态」核对项逐点验过）。
-    """
+    """由 x_in 与决策重建期末状态（末期没有下一期可借时也用这个）。"""
     xo = np.empty(Ly.dim)
     xo[:Ly.n_I] = np.asarray(rec["I_out"], float)
     o = np.empty((Ly.L - 1, Ly.N_R))
@@ -35,12 +38,15 @@ def out_state(Ly, x_in, rec) -> np.ndarray:
 
 
 def F_of(prob, Ly, x_in, scene) -> np.ndarray:
-    """失效台数 F = rint(θ·n)（与 subproblem.py 的 Fdef 两式定义一致）。"""
-    return np.rint(np.asarray(scene[1], float) * Ly.n(x_in))
+    """由 n_in 与场景 Θ 计算本期新失效 F_new = Σ_i N[i,G]。"""
+    th = np.asarray(scene[1], float)
+    n = Ly.n(x_in)
+    N = th * n[:, :, None]
+    return N[:, :, Ly.G].sum(axis=1)
 
 
 def cost_terms(prob, Ly, x_in, rec) -> np.ndarray:
-    """该期的五项成本（与 subproblem.py 的目标逐项对应）。"""
+    """该期的五项成本（与 code/subproblem.py 的目标逐项对应）。"""
     n_in, I_in, q_in = Ly.n(x_in), Ly.I(x_in), Ly.q(x_in)
     I_out = np.asarray(rec["I_out"], float)
     y = np.asarray(rec["y"], float)
@@ -55,21 +61,19 @@ def cost_terms(prob, Ly, x_in, rec) -> np.ndarray:
     ])
 
 
-def check_stage(prob, Ly, x, xo, q_out, taup, taum, S, y, scene_idx, ub) -> dict:
-    """核对一期：返回 {核对项: 该期最大违约量}（≤ tol 视为合规）。
+def check_stage(prob, Ly, x, xo, q_out, taup, taum, S, y, scene_idx, ub,
+                F_new=None) -> dict:
+    """核对一期，返回 {核对项: 该期最大违约量}（≤ TOL 视为合规）。
 
-    参数全部是**数组**（不是 worker 的 rec 字典），这样 `simulate.py`（手上有 rec）
-    与 `analyze_sim.py`（手上有 npz）能共用同一份判据。
-
-    **F 的判据不能拿取整函数硬比**：模型那条约束是 `θn − 0.5 ≤ F ≤ θn + 0.5`、`F ∈ ℤ`
-    （⇒ `F = rint(θn)`），当 `θn` 落在半整数附近 FeasTol(1e-6) 以内时，求解器允许 F 取
-    边界另一侧那一档。所以这里**从 age 行反解出模型自己的 F**，再查它是否落在
-    `[θn − 0.5, θn + 0.5]` 区间内（含容差）—— 这才是模型的真实约束。
+    N 由 n_in + 场景 Θ 重算（与模型里的 N=Θn 链接等价）。F_new 可选：
+    传入仿真记录的 F 时，核对记录值与重算值；不传则该项为 0。
+    fleet/dem 的右端与子问题一致为 N_r + fleet_tol：容差内的 LP 残差不算违规。
+    grade0/grade/W守恒 会因状态 round/repair 有 ≤state_repair_tol 的偏差，
+    simulate/analyze 对这三项用 STATE_NUMERIC_CHECKS 的阈值审计。
     """
-    NR, A, L = Ly.N_R, Ly.A, Ly.L
+    NR, G, L = Ly.N_R, Ly.G, Ly.L
     n_in, I_in, o_in, q_in = Ly.n(x), Ly.I(x), Ly.o(x), Ly.q(x)
-    n_out = Ly.n(xo)
-    I_out = np.asarray(xo[:Ly.n_I], float)
+    n_out, I_out, o_out = Ly.n(xo), np.asarray(xo[:Ly.n_I], float), Ly.o(xo)
     q_out = np.asarray(q_out, float)
     y = np.asarray(y, float)
     taup = np.asarray(taup, float)
@@ -77,39 +81,64 @@ def check_stage(prob, Ly, x, xo, q_out, taup, taum, S, y, scene_idx, ub) -> dict
     S = np.asarray(S, float)
     tau = taup - taum
     th = np.asarray(prob.pool[int(scene_idx)][1], float)
-    # 模型自己的 F：a ≤ A−2 从 age 行反解；A−1 无 age 行，只能按定义重算
-    F = np.empty((NR, A))
-    F[:, :A - 1] = n_in[:, :A - 1] - n_out[:, 1:]
-    F[:, A - 1] = np.rint(th[:, A - 1] * n_in[:, A - 1])
-    o_out = np.empty_like(o_in)
+
+    N = th * n_in[:, :, None]                     # (NR,G,G+1)
+    F_rec = N[:, :, G].sum(axis=1)
+    Y = y.sum(axis=1)
+    W_in = prob.N - n_in.sum(axis=1)
+    W_out = prob.N - n_out.sum(axis=1)
+
+    # 结构零：j<i 必须为 0
+    zero_dev = 0.0
+    for i in range(G):
+        if i:
+            zero_dev = max(zero_dev, float(np.max(np.abs(th[:, i, :i]))))
+    row_dev = float(np.max(np.abs(N.sum(axis=2) - n_in)))
+    f_dev = (float(np.max(np.abs(np.asarray(F_new, float) - F_rec)))
+             if F_new is not None else 0.0)
+    w_dev = float(np.max(np.abs(W_out - (W_in + F_rec - Y))))
+    grade_dev = 0.0
+    for j in range(1, G):
+        grade_dev = max(grade_dev, float(np.max(np.abs(
+            n_out[:, j] - N[:, :, j].sum(axis=1)))))
+    grade0_dev = float(np.max(np.abs(n_out[:, 0] - Y - N[:, 0, 0])))
+    # fleet/dem 右端与子问题一致：N + fleet_tol（纯 LP 的浮点残差口径）
+    cap = prob.N + prob.fleet_tol
+    dem_dev = float(np.maximum(Y + N[:, :, :G].sum(axis=(1, 2)) - cap, 0).max())
+    fleet_dev = float(np.maximum(n_in.sum(axis=1) - cap, 0).max())
+
+    o_out_calc = np.empty_like(o_in)
     for l in range(L - 2):
-        o_out[l] = o_in[l + 1]
-    o_out[L - 2] = q_in
-    prod = th * n_in
+        o_out_calc[l] = o_in[l + 1]
+    o_out_calc[L - 2] = q_in
 
     d = {
-        "pas": np.maximum(y.sum(axis=0) - I_in, 0).max(),
-        "dem": np.maximum(y.sum(axis=1) + n_in.sum(axis=1) - F.sum(axis=1) - prob.N, 0).max(),
-        "age0": np.abs(n_out[:, 0] - y.sum(axis=1)).max(),
-        "F定义": max(float(np.maximum(prod - 0.5 - F, 0).max()),
-                    float(np.maximum(F - prod - 0.5, 0).max())),
-        "send_def": np.abs(S - (I_in - y.sum(axis=0) + o_in[0])).max(),
-        "tau_bal": abs(tau.sum()),
-        "tau_lo": np.maximum(-(S + tau), 0).max(),
-        "tau_hi": np.maximum(S + tau - prob.Imax, 0).max(),
-        "tau_src": np.maximum(tau - (S.sum() - S), 0).max(),
-        "inv": np.abs(I_out - (S + tau)).max(),
-        "pipe": max([np.abs(o_out[l] - o_in[l + 1]).max() for l in range(L - 2)] or [0.0]),
-        "pipe_last": np.abs(o_out[L - 2] - q_in).max(),
-        "cap": np.maximum(I_out + o_out.sum(axis=0) + q_out - prob.Imax, 0).max(),
-        "界.下": np.maximum(-x, 0).max(),
-        "界.上": np.maximum(x - ub, 0).max(),
-        "整性": max(np.abs(v - np.rint(v)).max() for v in
-                    (n_in, I_in, o_in, q_in, n_out, I_out, q_out, y, taup, taum)),
+        "pas": float(np.maximum(y.sum(axis=0) - I_in, 0).max()),
+        "fleet": fleet_dev,
+        "dem": dem_dev,
+        "grade0": grade0_dev,
+        "grade": grade_dev,
+        "N链接": row_dev,
+        "结构零": zero_dev,
+        "F_new": f_dev,
+        "W守恒": w_dev,
+        "send_def": float(np.abs(S - (I_in - y.sum(axis=0) + o_in[0])).max()),
+        "tau_bal": float(abs(tau.sum())),
+        "tau_lo": float(np.maximum(-(S + tau), 0).max()),
+        "tau_hi": float(np.maximum(S + tau - prob.Imax, 0).max()),
+        "tau_src": float(np.maximum(tau - (S.sum() - S), 0).max()),
+        "inv": float(np.abs(I_out - (S + tau)).max()),
+        "pipe": max((float(np.abs(o_out[l] - o_in[l + 1]).max())
+                     for l in range(L - 2)), default=0.0),
+        "pipe_last": float(np.abs(o_out[L - 2] - q_in).max()),
+        "cap": float(np.maximum(I_out + o_out.sum(axis=0) + q_out - prob.Imax,
+                                0).max()),
+        "界.下": float(np.maximum(-x, 0).max()),
+        "界.上": float(np.maximum(x - ub, 0).max()),
     }
     return d
 
 
 def chain_dev(Ly, x, xo, rec) -> float:
-    """轨迹自洽：记录里重建的期末状态必须等于下一期的入库状态。"""
+    """轨迹自洽：记录的期末状态必须等于下一期的入库状态。"""
     return float(np.abs(np.asarray(xo, float) - out_state(Ly, x, rec)).max())

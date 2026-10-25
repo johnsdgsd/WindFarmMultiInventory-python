@@ -8,7 +8,10 @@ iterations = 200          # 训练轮数
 # 前向采样路径数 = forward_paths_per_process × n_processes（解析后的实际进程数）。
 # 保持 1 倍 ⇒ 每阶段试探点数恰好等于进程数 ⇒ 每个 worker 每阶段正好产出 1 条割。
 forward_paths_per_process = 1
-n_backward_samples = 30   # 后向每试探点采样的场景数；0 = 全枚举
+# 后向每试探点采样的场景数。**要得到对全池有效的下界，必须设 0（全枚举）**：
+# k>0 时割只对抽到的 k 条场景子集成立，LB 可能高于全池 UB（本次 30/300 就出现了
+# LB>前向均值）。设 0 后后向求解次数约为 1/k，500 轮约数小时。
+n_backward_samples = 0
 checkpoint_interval = 600.0   # 秒；训练中周期性落盘割
 
 # 割筛选（docs/LML1割筛选算法逻辑.md）
@@ -42,5 +45,5 @@ mip_rel_gap = 0.001       # MIP 相对 gap 容忍（0.1%）
 mip_time_limit = 20.0     # 单次 MIP 时限（秒）；到时限但有可行解就采用
 
 [output]
-tag = "base"              # 结果目录前缀：results/<tag>_<时间戳>/
+tag = "base_T60"              # 结果目录前缀：results/<tag>_<时间戳>/
 results_root = "results"

@@ -119,11 +119,10 @@ def cut_validity(make_stage, prob, cfg, cut, probes, cuts_next, scene) -> dict:
 
 
 def probe_states(rng, prob, n: int = 4, scale: float = 0.9):
-    """生成 n 个**可行**探测状态。
+    """生成 n 个**可行**探测状态（等级模型，纯 LP）。
 
-    模型对月龄分布有硬耦合（Σ_a n_in[r,a] ≤ N_r + Σ_a F[r,a]），逐分量随机取整几乎
-    必然越界 → 不可行。故月龄用多项分布按 N_r 切分（和恰好 = N_r，恒可行），其余
-    分量在 [0, scale·ub] 内随机取整。
+    n 用多项分布按 N_r 切分（和恰好 = N_r，fleet 行恒可行）；其余分量连续，
+    在 [0, scale·ub] 内随机取样，不做整数化。
     """
     Ly = prob.layout
     ub = Ly.upper(prob)
@@ -131,12 +130,12 @@ def probe_states(rng, prob, n: int = 4, scale: float = 0.9):
     for _ in range(n):
         s = np.zeros(Ly.dim)
         for r in range(prob.N_R):
-            w = rng.random(Ly.A) + 1e-6
+            w = rng.random(Ly.G) + 1e-6
             cnt = rng.multinomial(int(prob.N[r]), w / w.sum())
-            s[Ly.ix_n(r, 0):Ly.ix_n(r, 0) + Ly.A] = cnt
+            s[Ly.ix_n(r, 0):Ly.ix_n(r, 0) + Ly.G] = cnt
         for j in range(Ly.dim):
-            if Ly.off_n <= j < Ly.off_n + Ly.N_R * Ly.A:
+            if Ly.off_n <= j < Ly.off_n + Ly.N_R * Ly.G:
                 continue
-            s[j] = float(np.rint(rng.random() * scale * float(ub[j])))
+            s[j] = float(rng.random() * scale * float(ub[j]))
         out.append(s)
     return out

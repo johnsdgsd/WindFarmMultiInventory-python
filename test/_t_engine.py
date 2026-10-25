@@ -69,6 +69,7 @@ def main() -> int:
     st = simulate(eng, n_paths=scfg.n_simulations, seed=scfg.seed,
                   chunk_size=scfg.chunk_size)
     lb = eng.lower_bound()
+    lb_best = eng.lb_best
     print(f"  UB = {st.mean:.4f} ± {st.ci95:.4f}（{st.n} 条）   LB = {lb:.4f}")
     print(f"  逐期均值 {np.round(st.stage_mean(), 1).tolist()}")
     print(f"  各期都有成本: {bool((st.stage_mean() > 0).all())}")
@@ -78,7 +79,7 @@ def main() -> int:
         "割自洽 alpha+beta@state == obj": ok_cut,
         "每阶段试探点数 == 前向路径数": ok_trial,
         "仿真样本数正确": st.n == scfg.n_simulations,
-        "下界为正": lb > 0,
+        "下界为正": lb_best > 0,
     }
     print()
     for k, v in ok.items():

@@ -10,7 +10,7 @@
 子问题对象须支持：
     assemble(cuts_next, key=None)   拼装未来成本割（key 相同则跳过）
     set_state(x) / set_scene(scene) / set_point(x, scene)
-    solve_mip() / solve_lp()
+    solve_lp()                       # 纯 LP；solve_mip 仅保留给旧诊断脚本
     out_state_vector() / stage_cost() / gradient() / obj
     free()
 

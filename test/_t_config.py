@@ -48,14 +48,20 @@ print("§1 读回来的值就是 TOML 里写的值")
 print("=" * 78)
 p = load_problem_config(SRC_P)
 s = load_solver_config(SRC_S)
-print(f"  problem: T={p.T} A={p.A} N_R={p.N_R} L={p.L} C={p.C} m={p.m} eta={p.eta} "
-      f"pool={p.pool_size}")
+print(f"  problem: T={p.T} G={p.G} N_R={p.N_R} L={p.L} C={p.C} "
+      f"lambda0={p.lambda0} s={p.dirichlet_s} pool={p.pool_size}")
 print(f"  solver : iterations={s.iterations} 进程={s.n_processes} "
       f"倍率={s.forward_paths_per_process} 场景={s.n_backward_samples}")
-check("problem.T", p.T, 4)
+check("problem.T", p.T, 8)
+check("problem.G", p.G, 4)
 check("problem.N_R", p.N_R, 3)
-check("problem.m", p.m, 3.0)
+check("problem.lambda0", p.lambda0, 0.2)
+check("problem.dirichlet_s", p.dirichlet_s, 20.0)
+check("problem.init_mix 长度 == G", len(p.init_mix), p.G)
 check("problem.N 长度 == N_R", len(p.N), p.N_R)
+check("problem.fleet_tol", p.fleet_tol, 1e-6)
+check("problem.state_round_digits", p.state_round_digits, 6)
+check("problem.state_repair_tol", p.state_repair_tol, 1e-4)
 check("solver.iterations", s.iterations, 10)
 check("solver.n_processes", s.n_processes, 2)
 
@@ -63,8 +69,8 @@ print()
 print("=" * 78)
 print("§2 改 TOML 的值 ⇒ 读回来的值随之改变（默认值没有第二处）")
 print("=" * 78)
-for key, old, new in [("T", 4, 9), ("A", 24, 30), ("m", 3.0, 4.5),
-                      ("C", 50.0, 77.0)]:
+for key, old, new in [("T", 8, 9), ("lambda0", 0.2, 0.5),
+                      ("C", 50.0, 77.0), ("dirichlet_s", 20.0, 25.0)]:
     txt = SRC_P.read_text(encoding="utf-8").replace(f"{key} = {old}", f"{key} = {new}", 1)
     f = tmp / f"p_{key}.toml"
     f.write_text(txt, encoding="utf-8")
@@ -72,6 +78,29 @@ for key, old, new in [("T", 4, 9), ("A", 24, 30), ("m", 3.0, 4.5),
     got = getattr(q, key)
     print(f"  {key}: {old} → {new}  读到 {got}")
     check(f"改 {key} 生效", got, new)
+
+# fleet_tol 的 TOML 字面量是 1e-6，f"{1e-6}" 会渲染成 1e-06 —— 单独用字面量替换
+txt = SRC_P.read_text(encoding="utf-8").replace("fleet_tol = 1e-6",
+                                                "fleet_tol = 2e-6", 1)
+f = tmp / "p_fleet_tol.toml"
+f.write_text(txt, encoding="utf-8")
+q = load_problem_config(f)
+print(f"  fleet_tol: 1e-6 → 2e-6  读到 {q.fleet_tol}")
+check("改 fleet_tol 生效", q.fleet_tol, 2e-6)
+
+txt = SRC_P.read_text(encoding="utf-8").replace("state_round_digits = 6",
+                                                "state_round_digits = 7", 1)
+f = tmp / "p_state_round_digits.toml"
+f.write_text(txt, encoding="utf-8")
+q = load_problem_config(f)
+check("改 state_round_digits 生效", q.state_round_digits, 7)
+
+txt = SRC_P.read_text(encoding="utf-8").replace("state_repair_tol = 1e-4",
+                                                "state_repair_tol = 2e-4", 1)
+f = tmp / "p_state_repair_tol.toml"
+f.write_text(txt, encoding="utf-8")
+q = load_problem_config(f)
+check("改 state_repair_tol 生效", q.state_repair_tol, 2e-4)
 
 # 注意：TOML 里写的是 1e-6，而 f"{1e-6}" 会渲染成 1e-06 —— 替换串必须用字面量
 for key, old_s, new_s, new in [("iterations", "10", "33", 33),
@@ -102,6 +131,24 @@ txt = SRC_P.read_text(encoding="utf-8").replace("N_R = 3\n", "", 1)
 f = tmp / "missing.toml"
 f.write_text(txt, encoding="utf-8")
 check_raises("problem 少 N_R → KeyError", lambda: load_problem_config(f), KeyError)
+
+txt = SRC_P.read_text(encoding="utf-8").replace("fleet_tol = 1e-6\n", "", 1)
+f = tmp / "missing_fleet_tol.toml"
+f.write_text(txt, encoding="utf-8")
+check_raises("problem 少 fleet_tol → KeyError",
+             lambda: load_problem_config(f), KeyError)
+
+txt = SRC_P.read_text(encoding="utf-8").replace("state_round_digits = 6\n", "", 1)
+f = tmp / "missing_state_round_digits.toml"
+f.write_text(txt, encoding="utf-8")
+check_raises("problem 少 state_round_digits → KeyError",
+             lambda: load_problem_config(f), KeyError)
+
+txt = SRC_P.read_text(encoding="utf-8").replace("state_repair_tol = 1e-4\n", "", 1)
+f = tmp / "missing_state_repair_tol.toml"
+f.write_text(txt, encoding="utf-8")
+check_raises("problem 少 state_repair_tol → KeyError",
+             lambda: load_problem_config(f), KeyError)
 
 # 改键名而不是删整行：行尾有注释，按 "n_processes = 2\n" 找是找不到的
 txt = SRC_S.read_text(encoding="utf-8").replace("n_processes", "n_procs_renamed", 1)
@@ -137,9 +184,24 @@ print("=" * 78)
 print("§5 非法值被拦住（带具体数值的报错）")
 print("=" * 78)
 for i, (label, src, old, new, exc) in enumerate([
-        ("m < 1（h0(0)=∞）", "problem", "m = 3.0", "m = 0.5", ValueError),
-        ("eta <= 0", "problem", "eta = 8.0", "eta = -1.0", ValueError),
+        ("G < 2", "problem", "G = 4", "G = 1", ValueError),
+        ("lambda0 <= 0", "problem", "lambda0 = 0.2", "lambda0 = 0.0", ValueError),
+        ("dirichlet_s <= 0", "problem", "dirichlet_s = 20.0",
+         "dirichlet_s = 0.0", ValueError),
+        ("p_digits 越界", "problem", "p_digits = 3", "p_digits = 9", ValueError),
+        ("init_mix 长度错", "problem",
+         "init_mix = [0.5, 0.3, 0.15, 0.05]", "init_mix = [1.0, 0.0, 0.0]", ValueError),
         ("L < 2", "problem", "L = 2", "L = 1", ValueError),
+        ("fleet_tol < 0", "problem", "fleet_tol = 1e-6",
+         "fleet_tol = -1e-6", ValueError),
+        ("fleet_tol > 1e-3", "problem", "fleet_tol = 1e-6",
+         "fleet_tol = 1.0", ValueError),
+        ("state_round_digits > 12", "problem", "state_round_digits = 6",
+         "state_round_digits = 13", ValueError),
+        ("state_repair_tol < fleet_tol", "problem", "state_repair_tol = 1e-4",
+         "state_repair_tol = 1e-7", ValueError),
+        ("state_repair_tol > 1e-2", "problem", "state_repair_tol = 1e-4",
+         "state_repair_tol = 1.0", ValueError),
         ("pool_size < 2", "problem", "pool_size = 30", "pool_size = 1", ValueError),
         ("iterations < 0", "solver", "iterations = 10", "iterations = -1", ValueError),
         ("threads < 1", "solver", "threads_per_process = 1",
@@ -159,7 +221,11 @@ print("=" * 78)
 p9 = dataclasses.replace(p, T=9)
 check("replace 后 T", p9.T, 9)
 check_raises("replace 成非法值也报错",
-             lambda: dataclasses.replace(p, m=0.5), ValueError)
+             lambda: dataclasses.replace(p, lambda0=0.0), ValueError)
+check_raises("replace 成非法 fleet_tol 也报错",
+             lambda: dataclasses.replace(p, fleet_tol=1.0), ValueError)
+check_raises("replace 成非法 state_repair_tol 也报错",
+             lambda: dataclasses.replace(p, state_repair_tol=1.0), ValueError)
 
 shutil.rmtree(tmp, ignore_errors=True)
 

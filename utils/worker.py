@@ -77,15 +77,15 @@ def _stage0_sub(cuts_next, key):
 
 # ---------------------------------------------------------------- 前向任务
 def forward_path_task(task):
-    """走一条完整路径：t = 0..T 逐期解 MIP 得策略，读期末状态作为下期入库状态。
+    """走一条完整路径：t = 0..T 逐期解 LP 得策略，读期末状态作为下期入库状态。
 
     **一任务 = 一条路径**（用户要求的最小并行单位）。任务带的是**每阶段一个 ref**
     而不是一个整表 ref —— 前向要走遍所有阶段，故这块载荷整轮持有，由主管程统一释放。
-    返回 (states[1..T], costs[1..T], total_cost)。
+    返回 (states[1..T], costs[1..T], total_cost, records, 0)；
+    最后一个 0 是旧 MIP 回退计数，纯 LP 下恒为 0，保留五元组兼容仿真解包。
     """
     round_id, path_idx, scene_path, refs, record = task
     prob, T = _W["prob"], _W["T"]
-    fb0 = ce.MIP_FALLBACKS
     x = _W["x0"].copy()
     states, costs = [], []
     records = [] if record else None
@@ -106,7 +106,7 @@ def forward_path_task(task):
                 si = int(scene_path[t - 1])
                 sub.set_point(x, prob.pool[si])
             try:
-                sub.solve_mip()
+                sub.solve_lp()
             except Exception as exc:
                 raise _fail("forward", t, si, sub, exc)
             x = sub.out_state_vector()
@@ -115,7 +115,7 @@ def forward_path_task(task):
                 if record:
                     records.append({**sub.decision_values(), "cost": costs[-1],
                                     "scene": si})
-    return states, costs, float(sum(costs)), records, ce.MIP_FALLBACKS - fb0
+    return states, costs, float(sum(costs)), records, 0
 
 
 # ---------------------------------------------------------------- 后向任务

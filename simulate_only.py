@@ -1,4 +1,5 @@
 # simulate_only.py — 只做仿真：从已有结果目录恢复问题、配置与割，重跑蒙特卡洛。
+# 【LEGACY】旧月龄模型脚本；等级模型请用 simulate.py / analyze_sim.py。
 #
 #   python simulate_only.py results/base_20261010_120000
 #   python simulate_only.py results/base_20261010_120000 10000

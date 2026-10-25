@@ -32,8 +32,8 @@ sys.stdout.reconfigure(errors="replace")
 
 from code.config import load_problem_config, load_solver_config        # noqa: E402
 from code.problem_data import DefineProblem                            # noqa: E402
-from code.sim_analysis import (CHECKS, TERMS, chain_dev, check_stage,  # noqa: E402
-                               cost_terms, out_state)
+from code.sim_analysis import (CHECKS, STATE_NUMERIC_CHECKS, TERMS,  # noqa: E402
+                               chain_dev, check_stage, cost_terms, out_state)
 from code.subproblem import make_stage_subproblem                      # noqa: E402
 from utils import SDDPEngine                                           # noqa: E402
 from utils.io import has_configs, load_cuts                            # noqa: E402
@@ -42,23 +42,31 @@ TOL = 1e-6
 
 
 class Dump:
-    """把逐期逐变量攒成定长数组（float32 对 ≤16.7M 的整数无损）。"""
+    """把逐期逐变量攒成定长数组（纯 LP 小数状态 ⇒ float64）。
+
+    不存 x_out（可由 x_in+决策重建）；不存全量 N（由 n_in+场景 Θ 重算）。
+    存 n_out/F/W，供 analyze_sim 不重仿真直接分析。
+    """
 
     def __init__(self, n_paths: int, T: int, Ly, L: int):
-        P, NR = n_paths, Ly.N_R
-        sh = {"x_in": (P, T, Ly.dim), "x_out": (P, T, Ly.dim),
+        P, NR, G = n_paths, Ly.N_R, Ly.G
+        sh = {"x_in": (P, T, Ly.dim),
               "q": (P, T, NR), "taup": (P, T, NR), "taum": (P, T, NR),
-              "S_end": (P, T, NR), "y": (P, T, NR, NR)}
-        self.a = {k: np.zeros(s, np.float32) for k, s in sh.items()}
+              "S_end": (P, T, NR), "y": (P, T, NR, NR),
+              "n_out": (P, T, NR, G),
+              "F": (P, T, NR), "W_in": (P, T, NR), "W_out": (P, T, NR)}
+        self.a = {k: np.zeros(s, np.float64) for k, s in sh.items()}
         self.a["cost"] = np.zeros((P, T))
         self.a["terms"] = np.zeros((P, T, 5))
         self.a["theta"] = np.zeros((P, T))
         self.a["scene"] = np.zeros((P, T), np.int16)
         self.a["totals"] = np.zeros(P)
 
-    def fill(self, k0: int, results, prob, Ly) -> tuple[float, list]:
-        """写入第 k0 起的若干条路径，返回 (五项和 vs stage_cost 最大偏差, 审计累加)。"""
-        dev, audit = 0.0, []
+    def fill(self, k0: int, results, prob, Ly) -> tuple[float, dict]:
+        """写入第 k0 起的若干条路径，返回 (五项和 vs stage_cost 最大偏差,
+        各审计项的逐点最大违约量)。"""
+        dev = 0.0
+        audit = {c: 0.0 for c in CHECKS}
         ub = Ly.upper(prob)
         for i, (states, costs, total, recs, _) in enumerate(results):
             k = k0 + i
@@ -67,12 +75,15 @@ class Dump:
                 r = recs[t - 1]
                 xo = out_state(Ly, x, r)
                 self.a["x_in"][k, t - 1] = x
-                self.a["x_out"][k, t - 1] = xo
                 self.a["q"][k, t - 1] = np.asarray(r["q"], float)
                 self.a["taup"][k, t - 1] = np.asarray(r["taup"], float)
                 self.a["taum"][k, t - 1] = np.asarray(r["taum"], float)
                 self.a["S_end"][k, t - 1] = np.asarray(r["S_end"], float)
                 self.a["y"][k, t - 1] = np.asarray(r["y"], float)
+                self.a["n_out"][k, t - 1] = np.asarray(r["n_out"], float)
+                self.a["F"][k, t - 1] = np.asarray(r["F_new"], float)
+                self.a["W_in"][k, t - 1] = np.asarray(r["W_in"], float)
+                self.a["W_out"][k, t - 1] = np.asarray(r["W_out"], float)
                 tm = cost_terms(prob, Ly, x, r)
                 self.a["terms"][k, t - 1] = tm
                 self.a["cost"][k, t - 1] = float(r["cost"])
@@ -80,10 +91,13 @@ class Dump:
                 self.a["scene"][k, t - 1] = int(r["scene"])
                 dev = max(dev, abs(tm.sum() - float(r["cost"])))
                 a = check_stage(prob, Ly, x, xo, r["q"], r["taup"], r["taum"],
-                                r["S_end"], r["y"], r["scene"], ub)
+                                r["S_end"], r["y"], r["scene"], ub,
+                                F_new=r.get("F_new"))
                 if t < len(states):
                     a["链.状态"] = chain_dev(Ly, x, states[t], r)
-                audit.append(a)
+                for c in CHECKS:
+                    if c in a:
+                        audit[c] = max(audit[c], float(a[c]))
             self.a["totals"][k] = float(total)
         return dev, audit
 
@@ -110,12 +124,12 @@ def main(dir_arg: str, n_paths: int, chunk_size: int | None):
     chunk = int(chunk_size or scfg.chunk_size)
     print(f"结果目录 {d.name}")
     print(f"仿真 {n_paths} 条路径，块大小 {chunk}，种子 {scfg.seed}，"
-          f"T={T} A={prob.A} N_R={prob.N_R}")
+          f"T={T} G={prob.G} N_R={prob.N_R}")
 
     eng = SDDPEngine(prob, make_stage_subproblem, scfg, results_dir=d,
                      log=lambda *a, **k: None)
     dump = Dump(n_paths, T, Ly, prob.L)
-    audit: list[dict] = []
+    audit = {c: 0.0 for c in CHECKS}
     dev = 0.0
     t0 = time.time()
     try:
@@ -130,7 +144,8 @@ def main(dir_arg: str, n_paths: int, chunk_size: int | None):
             res = eng.forward_paths(sps, record=True)
             dv, au = dump.fill(done, res, prob, Ly)
             dev = max(dev, dv)
-            audit.extend(au)
+            for c in CHECKS:
+                audit[c] = max(audit[c], float(au[c]))
             done += n
             blk += 1
             print(f"  已仿真 {done}/{n_paths}  用时 {time.time()-t0:.0f} s", flush=True)
@@ -147,19 +162,22 @@ def main(dir_arg: str, n_paths: int, chunk_size: int | None):
     gap = (mean - lb) / abs(mean) * 100 if mean else float("nan")
 
     # ---- 约束审计汇总 ----
-    bad = {}
-    for c in CHECKS:
-        m = max((a[c] for a in audit if c in a), default=0.0)
-        if m > TOL:
-            bad[c] = m
+    state_tol = max(TOL, float(prob.state_repair_tol))
+    bad = {c: m for c, m in audit.items()
+           if m > (state_tol if c in STATE_NUMERIC_CHECKS else TOL)}
     # ---- 成本结构 ----
     terms = dump.a["terms"]
     tsum = terms.sum(axis=(0, 1))
     stage_mean = dump.a["cost"].mean(axis=0)
 
     np.savez_compressed(npz, **dump.a)
-    meta = {"dir": d.name, "n_paths": n_paths, "chunk_size": chunk, "T": T,
-            "A": prob.A, "N_R": prob.N_R, "L": prob.L, "state_dim": Ly.dim,
+    meta = {"dir": d.name, "model": "markov_grade", "schema": 2,
+            "n_paths": n_paths, "chunk_size": chunk, "T": T,
+            "G": prob.G, "N_R": prob.N_R, "L": prob.L, "state_dim": Ly.dim,
+            "lambda0": prob.lambda0, "dirichlet_s": prob.dirichlet_s,
+            "p_digits": prob.p_digits, "fleet_tol": prob.fleet_tol,
+            "state_round_digits": prob.state_round_digits,
+            "state_repair_tol": prob.state_repair_tol,
             "seed": int(scfg.seed), "terms": list(TERMS), "lb": lb,
             "mean": mean, "std": std, "ci95": ci, "gap_pct": gap,
             "wall_s": wall, "n_solves": n_solves,
@@ -180,8 +198,9 @@ def main(dir_arg: str, n_paths: int, chunk_size: int | None):
     A_(f"路径数        : {n_paths}    块大小 {chunk}（块种子 = seed + k，"
        f"结果依赖块划分）")
     A_(f"随机种子      : {scfg.seed}")
-    A_(f"问题规模      : T={T}  A={prob.A}  N_R={prob.N_R}  L={prob.L}  "
-       f"状态维 {Ly.dim}  池 {len(prob.pool)}")
+    A_(f"问题规模      : T={T}  G={prob.G}  N_R={prob.N_R}  L={prob.L}  "
+       f"状态维 {Ly.dim}  池 {len(prob.pool)}  fleet_tol {prob.fleet_tol:g}  "
+       f"round {prob.state_round_digits} 位  repair_tol {prob.state_repair_tol:g}")
     A_(f"训练轮次      : {meta_cuts.get('n_iterations')}    "
        f"割数 {sum(len(c) for c in cuts)}")
     A_("")
@@ -202,7 +221,9 @@ def main(dir_arg: str, n_paths: int, chunk_size: int | None):
     A_(f"  {'合计':<8}{s:>18,.1f}   {1.0:>7.2%}")
     A_(f"  对拍：五项之和 vs stage_cost 最大偏差 {dev:.3e}")
     A_("")
-    A_("— 约束审计（逐 (路径,期) 点核对全部约束 + 整性 + 轨迹链）—")
+    A_("— 约束审计（逐 (路径,期) 点核对全部约束 + 等级转移 + 轨迹链）—")
+    A_(f"  数值状态修正项 {STATE_NUMERIC_CHECKS} 阈值 {state_tol:g}；"
+       f"其余项 {TOL:g}")
     if not bad:
         A_("  全部通过 ✓   " + " / ".join(CHECKS))
     else:

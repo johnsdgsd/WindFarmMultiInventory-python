@@ -76,19 +76,23 @@ def read_config(d) -> dict:
 
 
 # ------------------------------------------------------- 问题配置一致性校验
-_PROBLEM_KEYS = ("T", "A", "N_R", "L", "N", "Qmax", "Imax", "C", "h", "Cs",
-                 "atc", "tc", "m", "eta", "a_beta", "pool_size", "seed",
-                 "spread_init")
+_PROBLEM_KEYS = ("T", "G", "N_R", "L", "N", "Qmax", "Imax", "fleet_tol",
+                 "state_round_digits", "state_repair_tol", "init_mix",
+                 "C", "h", "Cs", "atc", "tc",
+                 "lambda0", "dirichlet_s", "p_digits",
+                 "beta_cov", "z_bar", "cov", "priority",
+                 "pool_size", "seed")
 
 
 def problem_diff(a, b) -> list[str]:
     """比较两份 ProblemConfig 里**决定模型结构**的字段，返回不同的键名列表。
 
     改了这些字段就换了问题本身，旧割不再有效（铁律 4），resume 必须先拦住。
+    旧配置缺新键时用 None，避免 AttributeError（旧目录仍需全新训练）。
     """
     out = []
     for k in _PROBLEM_KEYS:
-        if getattr(a, k) != getattr(b, k):
+        if getattr(a, k, None) != getattr(b, k, None):
             out.append(k)
     return out
 
@@ -142,7 +146,7 @@ def save_cuts(d, cuts_by_stage, meta: dict, name: str = "cuts.json") -> Path:
 def load_cuts(d, t_max: int, dim: int, name: str = "cuts.json") -> tuple[list, dict]:
     """读回割，返回 (cuts_by_stage, meta)。
 
-    版本不符直接拒收：维度校验只能发现 T/A/N_R 这类变化，**发现不了模型结构改动**
+    版本不符直接拒收：维度校验只能发现 T/G/N_R 这类变化，**发现不了模型结构改动**
     （约束写法、参数化方式），而那种改动同样让旧割失效（铁律 4）。
     """
     payload = load_json(d, name)

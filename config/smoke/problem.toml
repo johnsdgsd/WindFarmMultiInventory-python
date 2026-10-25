@@ -1,17 +1,24 @@
 # 冒烟/自检用的极小问题。格式与 config/problem.toml 完全相同。
-# 短寿命 + 月龄摊平：让失效/到寿/调拨/订货链路在少数几期内全部被激活。
+#
+# 注意：冒烟用 lambda0=0.2（不是生产的 0.007），并混合初始等级，
+# 否则 T=8 内几乎不会出现失效，_t_engine/_t_sweep 的“LB>0”无法触发。
+# 生产配置仍是 lambda0=0.007、初始全等级 0。
 
 [dimension]
-T = 4
-A = 24
+T = 8
+G = 4
 N_R = 3
 L = 2
 
 [fleet]
-N = [10000, 8000, 5000]
-Qmax = [300, 100, 200]
-Imax = [1000, 400, 500]
-spread_init = true
+N = [1000, 800, 500]
+Qmax = [100, 50, 50]
+Imax = [200, 100, 100]
+fleet_tol = 1e-6
+state_round_digits = 6
+state_repair_tol = 1e-4
+# 混合初始等级，保证冒烟期有失效/调拨/订货
+init_mix = [0.5, 0.3, 0.15, 0.05]
 
 [cost]
 C = 50.0
@@ -21,9 +28,9 @@ atc = 5.0
 tc = 10.0
 
 [degradation]
-m = 3.0
-eta = 8.0
-a_beta = 2.0
+lambda0 = 0.2
+dirichlet_s = 20.0
+p_digits = 3
 beta_cov = [0.015, 0.025, 0.010]
 z_bar = [60.0, 5.0, 65.0]
 

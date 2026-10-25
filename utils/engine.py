@@ -2,7 +2,7 @@
 """算法骨架（阶段 0 = 虚拟首阶段，1..T 为真实周期；cuts[t] 近似 V_t）：
 
     每轮：
-      (a) 前向 —— 采样 N 条路径，每路径独立走完 T+1 期解 MIP 得策略，
+      (a) 前向 —— 采样 N 条路径，每路径独立走完 T+1 期解 LP 得策略，
           收齐试探点 trial[t] 与前向总成本（上界估计）；
       (b) 后向 —— **按阶段串行，期内并行**：t 从 T 递减到 1，把该阶段的 N 个试探点
           平均分给 worker，每 worker 对一个试探点枚举场景解 LP 取对偶、平均成一条割；
@@ -65,12 +65,18 @@ class SDDPEngine:
         self.log = log if log is not None else (lambda *a, **k: None)
 
         self.n_scenes = len(prob.pool)
+        _k = int(getattr(cfg, "n_backward_samples", 0))
+        if 0 < _k < self.n_scenes:
+            self.log(
+                f"[警告] 后向只抽 {_k}/{self.n_scenes} 个场景：割只对该子样本子问题成立，"
+                f"LB 可能高于全池 UB；要全池有效 LB 请把 n_backward_samples 设为 0")
         self.cuts: list[list[Cut]] = [[] for _ in range(self.T + 1)]
         for t in range(1, self.T + 1):
             self.cuts[t].append(trivial_cut(t, self.initial_state, self.state_dim))
 
         self.n_solves = 0
         self.n_cut_dropped = 0
+        self.lb_best = 0.0          # 历史最大合法 LB（LML1 删割时当前 LB 可能下降）
         self.round_id = 0
         self.last_iter = 0          # 最后一个完成的轮次（续训据此定起点）
         self.on_iter = None
@@ -182,6 +188,33 @@ class SDDPEngine:
         return n_added
 
     # ------------------------------------------------------------ LML1 割筛选
+    def restore_cut_history(self) -> int:
+        """从已加载的 cuts 重建 LML1 的试探点历史。
+
+        cuts.json 只保存 Cut，不保存 _pts/_mx/_rc。resume 后若不重建，第一次
+        _lml1_update 会把所有 it>0 的旧割当成“无主割”整体删掉。这里把每条
+        非平凡割的 state 作为试探点、其在 state 处的取值作为 mx、割本身作为
+        rc 恢复，让旧割和新割一样参与后续 LML1 的竞争与删除；只是不再在
+        resume 第一轮被整体清空。
+        """
+        self._pts = [[] for _ in range(self.T + 1)]
+        self._mx = [[] for _ in range(self.T + 1)]
+        self._rc = [[] for _ in range(self.T + 1)]
+        n = 0
+        for t in range(1, self.T + 1):
+            for c in self.cuts[t]:
+                if c.it == 0:
+                    continue
+                x = np.asarray(c.state, dtype=float).ravel()
+                if x.size != self.state_dim:
+                    raise ValueError(
+                        f"stage {t}: 割的 state 维度 {x.size} ≠ {self.state_dim}")
+                self._pts[t].append(x)
+                self._mx[t].append(float(c.alpha + c.beta @ x))
+                self._rc[t].append(c)
+                n += 1
+        return n
+
     def _lml1_update(self, t: int, new_points, new_cuts) -> None:
         """LML1：每个历史试探点只留「在该点取值最大的、生成最早」的那条割，
         没被任何点选中的割直接删除（docs/LML1割筛选算法逻辑.md）。
@@ -235,13 +268,19 @@ class SDDPEngine:
 
     # ------------------------------------------------------------------ 下界
     def lower_bound(self) -> float:
-        """阶段 0 子问题值。割只增不减 ⇒ LB 单调不减，且不依赖随机数。"""
+        """阶段 0 子问题值（**当前割集**）。
+
+        LML1 会删除未被任何试探点选中的割，因此当前 LB 可能下降；每个当前值仍是
+        真问题的合法下界。历史最大值另存 `self.lb_best`，只作诊断/报告，本方法
+        返回当前值，保持「LB = 当前割集的阶段 0 最优值」的语义。
+        """
         blk = put_cuts(self.cuts[1], self.state_dim)
         try:
             lb = float(self._map(lower_bound_task, [(self.round_id, blk.ref)])[0])
         finally:
             blk.close()
         self.n_solves += 1
+        self.lb_best = max(self.lb_best, lb)
         return lb
 
     # -------------------------------------------------------------- 主循环
@@ -269,7 +308,8 @@ class SDDPEngine:
                 lb = self.lower_bound()
                 self.last_iter = k
                 elapsed = time.time() - t0
-                rec = {"iter": k, "lb": lb, "sim": sim, "time": elapsed,
+                rec = {"iter": k, "lb": lb, "lb_best": self.lb_best,
+                       "sim": sim, "time": elapsed,
                        "solves": self.n_solves, "mip_fallback": n_fb,
                        "n_cuts": sum(len(c) for c in self.cuts[1:]),
                        "n_dropped": self.n_cut_dropped}
@@ -301,10 +341,15 @@ class SDDPEngine:
 
     def meta(self) -> dict:
         return {"T": self.T, "state_dim": self.state_dim, "seed": self.seed,
+                "model": "markov_grade",
+                "G": getattr(self.prob, "G", None),
+                "lambda0": getattr(self.prob, "lambda0", None),
+                "dirichlet_s": getattr(self.prob, "dirichlet_s", None),
                 "n_scenes": self.n_scenes,
                 "n_iterations": self.last_iter,
                 "n_cuts": sum(len(c) for c in self.cuts[1:]),
-                "n_solves": self.n_solves}
+                "n_solves": self.n_solves,
+                "lb_best": self.lb_best}
 
     def open_log(self, name: str = "sddp_training_log.csv") -> TrainingLog:
         if self.results_dir is None:

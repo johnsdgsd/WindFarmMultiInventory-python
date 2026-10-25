@@ -1,5 +1,16 @@
 # 风场多仓库备件库存管理案例 — Python 版（coptpy + 多进程 SDDP）
 
+> **★ 2026-10-24 当前模型：等级模型（纯 LP）**
+> 4 个运行健康等级 + 失效态 4；Poisson 增量 λ0=0.007；三位小数转移矩阵；
+> 逐行 Dirichlet；`N=Θn`；前向/后向都解 LP；状态维 40（T=240、L=3）。
+> `fleet`/`dem` 右端带 `fleet_tol=1e-6`；状态流转时 n 块 round 6 位，
+> 超额 ≤`state_repair_tol=1e-4` 从最大分量扣除（不缩放），超过才报错。
+> 当前实现见 `docs/建模与实现.md`；下文“Julia 原版/月龄/MIP/420 维”
+> 等描述是旧模型历史，旧结果/割 v2/v3/v4 不可 resume（当前 `FORMAT_VERSION=5`）。
+> 新模型验收：`test/_t_grade_calib.py`、`_t_grade_equiv.py`、`_t_grade_cutvalid.py`；
+> 更新后的 `_t_config/_t_assembly/_t_smoke/_t_sweep/_t_engine/_t_det`；
+> resume 验收：`_t_resume.py`；旧 age/rint/整数测试仅作历史。
+
 Julia 原版（`风场多仓库备件库存管理案例`）的 Python 重写。模型、时序、结果目录口径
 与 Julia 版逐项对齐；建模用 coptpy 直接建（原地改参数 + 自动热启动），SDDP 算法本体
 （对偶提取、割的表示与存储、多进程调度）自己实现，放在可整目录迁移的 `utils/` 包里。

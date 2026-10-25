@@ -50,30 +50,31 @@ def physical_cores() -> int:
 class ProblemConfig:
     # 维度
     T: int
-    A: int
+    G: int              # 运行健康等级数；失效态为 G
     N_R: int
     L: int
     # 机队
     N: list
     Qmax: list
     Imax: list
-    # 期初月龄摊开宽度：0 = 全在月龄 0（新机队）；K>0 = 均摊在月龄 0..K−1。
-    # 为什么要这个旋钮：rint(θ·n) 要求每个 (仓, 月龄) 桶 θ·n ≳ 0.5，桶内台数不足时
-    # 整桶失效归零（实测摊到 15 档以上会一台都不失效）。所以"摊多宽"不是自由选择。
-    spread_init: int
+    fleet_tol: float          # fleet/dem 右端的数值容差（台）
+    state_round_digits: int   # 状态流转时 n 块保留的小数位
+    state_repair_tol: float   # 只修正不超过该值的 Σn 超额（台）
+    # 初始等级分布（长度 G、非负、和为 1）；[1,0,..] = 全新机队
+    init_mix: list
     # 成本
     C: float
     h: float
     Cs: float
     atc: float
     tc: float
-    # 退化
-    m: float
-    eta: float
-    a_beta: float
+    # 退化/转移
+    lambda0: float       # Poisson 基准均值（月度）
+    dirichlet_s: float   # 逐行 Dirichlet 集中度
+    p_digits: int        # 转移矩阵保留小数位
     beta_cov: list
     z_bar: list
-    # 协变量分布
+    # 协变量分布（cov["lambda"] 是启停次数均值，与 lambda0 不是同一个量）
     cov: dict
     # 场景池
     pool_size: int
@@ -89,8 +90,8 @@ class ProblemConfig:
     def _check(self) -> None:
         if self.T <= 0:
             raise ValueError(f"[dimension] T 必须为正，实际 {self.T}")
-        if self.A <= 1:
-            raise ValueError(f"[dimension] A 必须大于 1，实际 {self.A}")
+        if self.G < 2:
+            raise ValueError(f"[dimension] G（运行等级数）必须 ≥ 2，实际 {self.G}")
         if self.N_R <= 0:
             raise ValueError(f"[dimension] N_R 必须为正，实际 {self.N_R}")
         if self.L < 2:
@@ -105,16 +106,30 @@ class ProblemConfig:
                 raise ValueError(f"[fleet] {name} 不得含负值：{v}")
         if any(int(x) == 0 for x in self.Qmax):
             raise ValueError(f"[fleet] Qmax 不得含 0（仓库无法订货）：{self.Qmax}")
-        if self.spread_init < 0:
-            raise ValueError(f"[fleet] spread_init 不得为负，实际 {self.spread_init}")
-        if self.spread_init > self.A:
-            raise ValueError(f"[fleet] spread_init={self.spread_init} 超过月龄档数 A={self.A}")
+        if not (0.0 <= float(self.fleet_tol) <= 1e-3):
+            raise ValueError(f"[fleet] fleet_tol 必须在 [0, 1e-3] 台，"
+                             f"实际 {self.fleet_tol}")
+        if not (0 <= int(self.state_round_digits) <= 12):
+            raise ValueError(f"[fleet] state_round_digits 必须在 0..12，"
+                             f"实际 {self.state_round_digits}")
+        if not (float(self.fleet_tol) <= float(self.state_repair_tol) <= 1e-2):
+            raise ValueError(f"[fleet] state_repair_tol 必须在 "
+                             f"[fleet_tol, 1e-2] 台，实际 {self.state_repair_tol}")
 
-        if self.m < 1:
-            raise ValueError(f"[degradation] 威布尔形状参数 m 必须 ≥ 1"
-                             f"（m<1 时 h0(0)=∞），实际 {self.m}")
-        if self.eta <= 0:
-            raise ValueError(f"[degradation] 威布尔尺度参数 eta 必须为正，实际 {self.eta}")
+        if len(self.init_mix) != self.G:
+            raise ValueError(f"[fleet] init_mix 长度 {len(self.init_mix)} ≠ G={self.G}")
+        if any(float(x) < 0 for x in self.init_mix):
+            raise ValueError(f"[fleet] init_mix 不得含负值：{self.init_mix}")
+        s = float(sum(self.init_mix))
+        if abs(s - 1.0) > 1e-8:
+            raise ValueError(f"[fleet] init_mix 必须和为 1，实际 {s}")
+
+        if self.lambda0 <= 0:
+            raise ValueError(f"[degradation] lambda0 必须为正，实际 {self.lambda0}")
+        if self.dirichlet_s <= 0:
+            raise ValueError(f"[degradation] dirichlet_s 必须为正，实际 {self.dirichlet_s}")
+        if not (0 <= int(self.p_digits) <= 6):
+            raise ValueError(f"[degradation] p_digits 必须在 0..6，实际 {self.p_digits}")
         if len(self.beta_cov) != 3 or len(self.z_bar) != 3:
             raise ValueError(f"[degradation] PHM 要求 3 维协变量，实际 "
                              f"beta_cov={self.beta_cov}、z_bar={self.z_bar}")
@@ -148,28 +163,28 @@ def load_problem_config(path) -> ProblemConfig:
     cov = _section(raw, "covariate", path.name)
     scen = _section(raw, "scenario", path.name)
     prio = raw.get("priority")
-    si = _req(fleet, "spread_init", "problem.toml/fleet")
-    if isinstance(si, bool):
-        raise TypeError("problem.toml/fleet.spread_init 自 2026-10-12 起是**整数**摊开宽度"
-                        "（0 = 全在月龄 0，K = 摊在月龄 0..K−1）；写 true 会产生"
-                        "「全在月龄 0」的歧义，请改写 0 或具体档数")
     return ProblemConfig(
         T=int(_req(dim, "T", "problem.toml/dimension")),
-        A=int(_req(dim, "A", "problem.toml/dimension")),
+        G=int(_req(dim, "G", "problem.toml/dimension")),
         N_R=int(_req(dim, "N_R", "problem.toml/dimension")),
         L=int(_req(dim, "L", "problem.toml/dimension")),
         N=[int(v) for v in _req(fleet, "N", "problem.toml/fleet")],
         Qmax=[int(v) for v in _req(fleet, "Qmax", "problem.toml/fleet")],
         Imax=[int(v) for v in _req(fleet, "Imax", "problem.toml/fleet")],
-        spread_init=int(si),
+        fleet_tol=float(_req(fleet, "fleet_tol", "problem.toml/fleet")),
+        state_round_digits=int(_req(fleet, "state_round_digits",
+                                    "problem.toml/fleet")),
+        state_repair_tol=float(_req(fleet, "state_repair_tol",
+                                    "problem.toml/fleet")),
+        init_mix=[float(v) for v in _req(fleet, "init_mix", "problem.toml/fleet")],
         C=float(_req(cost, "C", "problem.toml/cost")),
         h=float(_req(cost, "h", "problem.toml/cost")),
         Cs=float(_req(cost, "Cs", "problem.toml/cost")),
         atc=float(_req(cost, "atc", "problem.toml/cost")),
         tc=float(_req(cost, "tc", "problem.toml/cost")),
-        m=float(_req(deg, "m", "problem.toml/degradation")),
-        eta=float(_req(deg, "eta", "problem.toml/degradation")),
-        a_beta=float(_req(deg, "a_beta", "problem.toml/degradation")),
+        lambda0=float(_req(deg, "lambda0", "problem.toml/degradation")),
+        dirichlet_s=float(_req(deg, "dirichlet_s", "problem.toml/degradation")),
+        p_digits=int(_req(deg, "p_digits", "problem.toml/degradation")),
         beta_cov=[float(v) for v in _req(deg, "beta_cov", "problem.toml/degradation")],
         z_bar=[float(v) for v in _req(deg, "z_bar", "problem.toml/degradation")],
         cov={k: float(_req(cov, k, "problem.toml/covariate"))

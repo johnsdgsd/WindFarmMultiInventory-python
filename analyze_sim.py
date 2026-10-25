@@ -7,7 +7,7 @@
 #   ② 主动调拨 τ：激活程度、τ⁺/τ⁻ 并存（已知瑕疵）、按仓净流
 #   ③ 被动调拨 y：本地/跨仓、按优先级路线的单调性、互补松弛
 #   ④ 订货 q：贴限情况、base-stock 形态、对失效的超前性
-#   ⑤ 逐期轨迹：库存/停机/月龄/在途
+#   ⑤ 逐期轨迹：库存/停机/等级/在途
 from __future__ import annotations
 
 import sys
@@ -21,7 +21,8 @@ sys.stdout.reconfigure(errors="replace")
 
 from code.config import load_problem_config            # noqa: E402
 from code.problem_data import DefineProblem            # noqa: E402
-from code.sim_analysis import CHECKS, check_stage      # noqa: E402
+from code.sim_analysis import (CHECKS, STATE_NUMERIC_CHECKS,  # noqa: E402
+                               check_stage)
 from code.state_layout import StateLayout              # noqa: E402
 from utils.io import load_json                         # noqa: E402
 
@@ -54,22 +55,37 @@ def main():
 
     meta = load_json(d, f.stem + ".json")
     prob = DefineProblem(load_problem_config(d / "config" / "problem.toml"))
-    Ly, NR, A, T = prob.layout, prob.N_R, prob.A, prob.T
+    Ly, NR, G, T = prob.layout, prob.N_R, prob.G, prob.T
+    if (meta.get("model") != "markov_grade"
+            or int(meta.get("G", -1)) != G
+            or int(meta.get("state_dim", -1)) != Ly.dim):
+        raise SystemExit("这份 npz 是旧月龄模型/旧 schema，等级模型请用当前代码重跑 simulate.py")
     P = int(meta["n_paths"])
     z = np.load(f)
     x_in = z["x_in"].astype(float)
-    x_out = z["x_out"].astype(float)
-    q, taup, taum = z["q"].astype(float), z["taup"].astype(float), z["taum"].astype(float)
+    q = z["q"].astype(float)
+    taup, taum = z["taup"].astype(float), z["taum"].astype(float)
+    S_end = z["S_end"].astype(float)
     y, terms = z["y"].astype(float), z["terms"]
+    n_out = z["n_out"].astype(float)
+    F = z["F"].astype(float)
+    W_in, W_out = z["W_in"].astype(float), z["W_out"].astype(float)
     scene = z["scene"].astype(int)
-    n_in = x_in[:, :, Ly.off_n:Ly.off_n + Ly.n_n].reshape(P, T, NR, A)
-    I_in, I_out = x_in[:, :, :Ly.n_I], x_out[:, :, :Ly.n_I]
+
+    n_in = x_in[:, :, Ly.off_n:Ly.off_n + Ly.n_n].reshape(P, T, NR, G)
+    I_in = x_in[:, :, :Ly.n_I]
+    # 期末状态没有落盘：由 inv 行与 out_state 规则重建
+    I_out = S_end + taup - taum
     o_in = x_in[:, :, Ly.off_o:Ly.off_o + Ly.n_o].reshape(P, T, prob.L - 1, NR)
-    o_out = x_out[:, :, Ly.off_o:Ly.off_o + Ly.n_o].reshape(P, T, prob.L - 1, NR)
-    F = np.zeros((P, T, NR))
-    for t in range(T):
-        th = np.array([prob.pool[scene[p, t]][1] for p in range(P)])   # (P,NR,A)
-        F[:, t, :] = np.rint(th * n_in[:, t]).sum(axis=2)
+    q_in = x_in[:, :, Ly.off_q:Ly.off_q + Ly.n_q]
+    o_out = np.empty_like(o_in)
+    o_out[:, :, :-1] = o_in[:, :, 1:]
+    o_out[:, :, -1] = q_in
+    xo = np.zeros_like(x_in)
+    xo[:, :, :Ly.n_I] = I_out
+    xo[:, :, Ly.off_o:Ly.off_o + Ly.n_o] = o_out.reshape(P, T, Ly.n_o)
+    xo[:, :, Ly.off_n:Ly.off_n + Ly.n_n] = n_out.reshape(P, T, Ly.n_n)
+    xo[:, :, Ly.off_q:Ly.off_q + Ly.n_q] = q
 
     print(f"{f.name}   路径 {P} × {T} 期   种子 {meta['seed']} "
           f"块 {meta.get('chunk_size', '—')}")
@@ -84,7 +100,7 @@ def main():
 
     # ================================================================ 约束审计
     step = max(1, P // min(P, AUDIT_PATHS))
-    head(f"约束审计（门禁：复算全部约束 + 整性 + 轨迹链）"
+    head(f"约束审计（门禁：复算全部约束 + 等级转移 + 轨迹链）"
          f"[抽查 {len(range(0, P, step))}/{P} 条]")
     ub = Ly.upper(prob)
     S_end = z["S_end"].astype(float)
@@ -92,21 +108,26 @@ def main():
     npt = 0
     for p in range(0, P, step):
         for t in range(T):
-            x, xo = x_in[p, t], x_out[p, t]
-            d = check_stage(prob, Ly, x, xo, q[p, t], taup[p, t], taum[p, t],
-                            S_end[p, t], y[p, t], scene[p, t], ub)
+            xi, xo_t = x_in[p, t], xo[p, t]
+            d = check_stage(prob, Ly, xi, xo_t, q[p, t], taup[p, t], taum[p, t],
+                            S_end[p, t], y[p, t], scene[p, t], ub,
+                            F_new=F[p, t])
             if t + 1 < T:
-                d["链.状态"] = float(np.abs(x_in[p, t + 1] - xo).max())
+                d["链.状态"] = float(np.abs(x_in[p, t + 1] - xo_t).max())
             npt += 1
             for c in CHECKS:
                 if c in d:
                     bad[c] = max(bad.get(c, 0.0), float(d[c]))
-    viol = {k: v for k, v in bad.items() if v > TOL}
-    print(f"  共核对 {npt:,} 个 (路径,期) 点，age/F 类等式 {npt * Ly.n_n:,} 条")
+    state_tol = max(TOL, float(prob.state_repair_tol))
+    viol = {k: v for k, v in bad.items()
+            if v > (state_tol if k in STATE_NUMERIC_CHECKS else TOL)}
+    print(f"  共核对 {npt:,} 个 (路径,期) 点，等级/N/F 等式按 N_R×G 计")
+    print(f"  数值状态修正项 {STATE_NUMERIC_CHECKS} 阈值 {state_tol:g}；"
+          f"其余项 {TOL:g}")
     if not viol:
         print("  全部通过 ✓   " + " / ".join(CHECKS))
     else:
-        print("  ★ 有违规（阈值 1e-6）：")
+        print("  ★ 有违规：")
         for k, v in sorted(viol.items(), key=lambda kv: -kv[1]):
             print(f"    {k:<12} 最大违约量 {v:,.6g}")
 
@@ -238,9 +259,9 @@ def main():
           # 停机：先按路径求 (N − Σn)，再对路径取均值 —— 直接 axis=(0,2,3) 求和会得到负数
           "停机": (prob.N.sum() - n_in.sum(axis=3).sum(axis=2)).mean(axis=0),
           "订货 q": q.sum(axis=(0, 2)), "失效 F": F.sum(axis=(0, 2))}
-    ages = np.arange(A)
+    grades = np.arange(G)
     tot_n = n_in.sum(axis=(0, 2, 3))
-    tr["平均月龄"] = np.array([float((n_in[:, t] * ages).sum() / tot_n[t])
+    tr["平均等级"] = np.array([float((n_in[:, t] * grades).sum() / tot_n[t])
                               if tot_n[t] > 0 else np.nan for t in range(T)])
     for k, v in tr.items():
         print(f"  {k:<8}" + " ".join(f"{v[t]:>8,.0f}" if not np.isnan(v[t]) else "     nan"
@@ -252,7 +273,7 @@ def main():
     util = load / prob.Imax[None, None, :]
     down = prob.N[None, None, :] - n_in.sum(axis=3)      # 停机台数
     tau_n = taup - taum                                  # 净流入（共享池，不区分对手方）
-    DIE = T - 1                                          # 0 基下标：末期（T 期内 A 不触达，无到寿悬崖）
+    DIE = T - 1                                          # 0 基下标：末期（等级模型无到寿档）
     LO = max(0, T - 20)                                  # 只统计末 20 期的容量压力
 
     # ---- A. 末期前有没有提前备货？缺口是不是被容量堵死的？----

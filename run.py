@@ -60,8 +60,8 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
     print("=" * 66)
     print(f"生效配置（来自 {cdir}）")
     print("=" * 66)
-    print(f"问题   T={pcfg.T}  A={pcfg.A}  N_R={pcfg.N_R}  L={pcfg.L}  "
-          f"池={pcfg.pool_size}  m={pcfg.m}  eta={pcfg.eta}")
+    print(f"问题   T={pcfg.T}  G={pcfg.G}  N_R={pcfg.N_R}  L={pcfg.L}  "
+          f"池={pcfg.pool_size}  λ0={pcfg.lambda0}  s={pcfg.dirichlet_s}")
     print(scfg.describe())
 
     overrides = []
@@ -106,10 +106,14 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
         if resume_dir is not None:
             cuts, meta = load_cuts(d, prob.T, prob.state_dim)
             eng.cuts = cuts
+            eng.lb_best = float(meta.get("lb_best", 0.0))
+            if eng.cut_selection == "lml1":
+                n_hist = eng.restore_cut_history()
+                print(f"LML1 历史已从割的 state 重建：{n_hist} 条记录")
             start_iter = int(meta.get("n_iterations", 0)) + 1
             archive_log(d)
             print(f"续训：从 {d} 读回 {sum(len(c) for c in cuts)} 条割，"
-                  f"起始轮次 {start_iter}（重启下界 = {eng.lower_bound():.4f}）")
+                  f"起始轮次 {start_iter}（当前割集下界 = {eng.lower_bound():.4f}）")
             write_configs(d, cdir / "problem.toml", cdir / "solver.toml")
 
         log = eng.open_log()
