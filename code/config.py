@@ -204,10 +204,25 @@ class SolverConfig:
     forward_paths_per_process: int
     n_backward_samples: int
     checkpoint_interval: float
+    max_train_seconds: float
     seed: int
     cut_selection: str
     cut_select_eps: float
     cut_select_keep_rounds: int
+    # DG-CSER 跨阶段经验回放
+    replay_enabled: bool
+    replay_period: int
+    replay_k_local: int
+    replay_k_cross: int
+    replay_coverage_quantile: float
+    replay_max_pool: int
+    replay_diversity_eps: float
+    replay_groups: list
+    replay_group_labels: list
+    replay_hybrid_stages: list
+    replay_top_targets: int
+    replay_hybrid_start: int
+    replay_hybrid_keep_rounds: int
     # 并行
     n_processes: int
     threads_per_process: int
@@ -249,6 +264,9 @@ class SolverConfig:
         if self.n_backward_samples < 0:
             raise ValueError(f"[training] n_backward_samples 不得为负（0 = 全枚举），"
                              f"实际 {self.n_backward_samples}")
+        if self.max_train_seconds < 0:
+            raise ValueError(f"[training] max_train_seconds 不得为负（0 = 不限时），"
+                             f"实际 {self.max_train_seconds}")
         if self.cut_selection not in ("none", "lml1"):
             raise ValueError(f"[training] cut_selection 只能是 none/lml1，"
                              f"实际 {self.cut_selection!r}")
@@ -258,6 +276,33 @@ class SolverConfig:
         if self.cut_select_keep_rounds < 0:
             raise ValueError(f"[training] cut_select_keep_rounds 不得为负，"
                              f"实际 {self.cut_select_keep_rounds}")
+        if self.replay_period < 1:
+            raise ValueError(f"[replay] period 必须 ≥ 1，实际 {self.replay_period}")
+        if self.replay_k_local < 0 or self.replay_k_cross < 0:
+            raise ValueError(f"[replay] k_local/k_cross 不得为负，实际 "
+                             f"{self.replay_k_local}/{self.replay_k_cross}")
+        if not (0.0 < float(self.replay_coverage_quantile) < 1.0):
+            raise ValueError(f"[replay] coverage_quantile 必须在 (0,1)，"
+                             f"实际 {self.replay_coverage_quantile}")
+        if self.replay_max_pool < 1:
+            raise ValueError(f"[replay] max_pool 必须 ≥ 1，实际 {self.replay_max_pool}")
+        if self.replay_diversity_eps < 0:
+            raise ValueError(f"[replay] diversity_eps 不得为负，"
+                             f"实际 {self.replay_diversity_eps}")
+        if len(self.replay_groups) != len(self.replay_group_labels):
+            raise ValueError(f"[replay] groups 与 group_labels 长度不一致："
+                             f"{len(self.replay_groups)} vs {len(self.replay_group_labels)}")
+        if self.replay_enabled and not self.replay_groups and self.replay_top_targets <= 0:
+            raise ValueError("[replay] enabled=true 但 groups 为空且 top_targets=0")
+        if self.replay_top_targets < 0:
+            raise ValueError(f"[replay] top_targets 不得为负，"
+                             f"实际 {self.replay_top_targets}")
+        if self.replay_hybrid_start < 1:
+            raise ValueError(f"[replay] hybrid_start 必须 ≥ 1，"
+                             f"实际 {self.replay_hybrid_start}")
+        if self.replay_hybrid_keep_rounds < 0:
+            raise ValueError(f"[replay] hybrid_keep_rounds 不得为负，"
+                             f"实际 {self.replay_hybrid_keep_rounds}")
         if self.threads_per_process < 1:
             raise ValueError(f"[parallel] threads_per_process 必须 ≥ 1，"
                              f"实际 {self.threads_per_process}")
@@ -277,9 +322,14 @@ class SolverConfig:
             f"训练   轮数 {self.iterations}  前向路径 {self.n_forward_paths}"
             f"（{self.forward_paths_per_process} × {self.n_processes} 进程）"
             f"  后向场景 {self.n_backward_samples or '全枚举'}"
-            f"  割筛选 {self.cut_selection}",
+            f"  割筛选 {self.cut_selection}"
+            f"  时限 {self.max_train_seconds or '不限'} s",
             f"并行   进程 {self.n_processes}  每进程 COPT 线程 {self.threads_per_process}",
             f"仿真   路径 {self.n_simulations}  块大小 {self.chunk_size}",
+            f"回放   {'开' if self.replay_enabled else '关'}  Z={self.replay_period}  "
+            f"K_local={self.replay_k_local}  K_cross={self.replay_k_cross}  "
+            f"top={self.replay_top_targets}  hybrid_start={self.replay_hybrid_start}"
+            f"/keep={self.replay_hybrid_keep_rounds}  groups={self.replay_groups}",
             f"数值   FeasTol {self.feas_tol:g}  DualTol {self.dual_tol:g}  "
             f"IntTol {self.int_tol:g}  Presolve {self.presolve}",
             f"输出   {self.results_root}/{self.tag}_<时间戳>",
@@ -294,6 +344,7 @@ def load_solver_config(path, *, resolve: bool = True) -> SolverConfig:
     pa = _section(raw, "parallel", path.name)
     si = _section(raw, "simulation", path.name)
     nu = _section(raw, "numerics", path.name)
+    rp = _section(raw, "replay", path.name)
     ou = _section(raw, "output", path.name)
     cfg = SolverConfig(
         iterations=int(_req(tr, "iterations", "solver.toml/training")),
@@ -301,10 +352,31 @@ def load_solver_config(path, *, resolve: bool = True) -> SolverConfig:
             _req(tr, "forward_paths_per_process", "solver.toml/training")),
         n_backward_samples=int(_req(tr, "n_backward_samples", "solver.toml/training")),
         checkpoint_interval=float(_req(tr, "checkpoint_interval", "solver.toml/training")),
+        max_train_seconds=float(
+            _req(tr, "max_train_seconds", "solver.toml/training")),
         seed=int(_req(tr, "seed", "solver.toml/training")),
         cut_selection=str(_req(tr, "cut_selection", "solver.toml/training")),
         cut_select_eps=float(_req(tr, "cut_select_eps", "solver.toml/training")),
         cut_select_keep_rounds=int(_req(tr, "cut_select_keep_rounds", "solver.toml/training")),
+        replay_enabled=bool(_req(rp, "enabled", "solver.toml/replay")),
+        replay_period=int(_req(rp, "period", "solver.toml/replay")),
+        replay_k_local=int(_req(rp, "k_local", "solver.toml/replay")),
+        replay_k_cross=int(_req(rp, "k_cross", "solver.toml/replay")),
+        replay_coverage_quantile=float(
+            _req(rp, "coverage_quantile", "solver.toml/replay")),
+        replay_max_pool=int(_req(rp, "max_pool", "solver.toml/replay")),
+        replay_diversity_eps=float(
+            _req(rp, "diversity_eps", "solver.toml/replay")),
+        replay_groups=[[int(x) for x in g]
+                       for g in _req(rp, "groups", "solver.toml/replay")],
+        replay_group_labels=[[str(x) for x in g]
+                             for g in _req(rp, "group_labels", "solver.toml/replay")],
+        replay_hybrid_stages=[int(x) for x in
+                              _req(rp, "hybrid_stages", "solver.toml/replay")],
+        replay_top_targets=int(_req(rp, "top_targets", "solver.toml/replay")),
+        replay_hybrid_start=int(_req(rp, "hybrid_start", "solver.toml/replay")),
+        replay_hybrid_keep_rounds=int(
+            _req(rp, "hybrid_keep_rounds", "solver.toml/replay")),
         n_processes=int(_req(pa, "n_processes", "solver.toml/parallel")),
         threads_per_process=int(_req(pa, "threads_per_process", "solver.toml/parallel")),
         n_simulations=int(_req(si, "n_simulations", "solver.toml/simulation")),

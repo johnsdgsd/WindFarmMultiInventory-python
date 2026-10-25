@@ -48,10 +48,12 @@ class SDDPEngine:
     results_dir   : 结果目录（求解失败时的现场 LP 落这里）
     """
 
-    def __init__(self, prob, make_sub, cfg, *, results_dir=None, log=print):
+    def __init__(self, prob, make_sub, cfg, *, results_dir=None, log=print,
+                 replay=None):
         self.prob = prob
         self.make_sub = make_sub
         self.cfg = cfg
+        self.replay = replay
         self.T = int(prob.T)
         self.state_dim = int(prob.state_dim)
         self.initial_state = np.round(
@@ -62,6 +64,7 @@ class SDDPEngine:
         self.n_processes = int(cfg.n_processes)
         self.results_dir = None if results_dir is None else Path(results_dir)
         self.checkpoint_interval = float(cfg.checkpoint_interval)
+        self.max_train_seconds = float(getattr(cfg, "max_train_seconds", 0.0))
         self.log = log if log is not None else (lambda *a, **k: None)
 
         self.n_scenes = len(prob.pool)
@@ -77,6 +80,7 @@ class SDDPEngine:
         self.n_solves = 0
         self.n_cut_dropped = 0
         self.lb_best = 0.0          # 历史最大合法 LB（LML1 删割时当前 LB 可能下降）
+        self.last_lb = 0.0          # 上一轮 lower_bound()；回放诊断的 θ_0
         self.round_id = 0
         self.last_iter = 0          # 最后一个完成的轮次（续训据此定起点）
         self.on_iter = None
@@ -88,6 +92,12 @@ class SDDPEngine:
         self._pts: list[list] = [[] for _ in range(self.T + 1)]   # 历史试探点
         self._mx: list[list] = [[] for _ in range(self.T + 1)]    # 该点处当前最大割值
         self._rc: list[list] = [[] for _ in range(self.T + 1)]    # 保留的最旧最大割
+        # 回放在高松弛阶段的割保留策略；由 replay.setup() 填充。
+        self.hybrid_stages: set[int] = set()
+        self.hybrid_start = 1
+        self.hybrid_keep_rounds = 0
+        if self.replay is not None:
+            self.replay.setup(self)
         self._pool = None
         if self.n_processes > 1:
             self._pool = _default_ctx().Pool(
@@ -157,11 +167,14 @@ class SDDPEngine:
         return results
 
     # ------------------------------------------------------------ 后向 pass
-    def backward(self, trial, it: int) -> int:
+    def backward(self, trial, it: int, *, pass_tag: str = "bwd") -> int:
         """按阶段串行（t = T..1），期内按试探点并行。返回新增割数。
 
         每个阶段：本阶段全部试探点的割算完，一起入库，再推进到 t−1 —— 这样期 t−1
         用到的 cuts[t] 已含本轮新割。
+
+        pass_tag 让同一轮内的回放 pass 与标准 pass 使用不同 worker 模型键：
+        回放在 t+1 阶段新增的割必须让 t 阶段重新 assemble，否则热缓存会用旧割。
         """
         n_added = 0
         for t in range(self.T, 0, -1):
@@ -172,13 +185,13 @@ class SDDPEngine:
             blk = put_cuts(self.cuts[t + 1] if t < self.T else [], self.state_dim)
             try:
                 tasks = [(self.round_id, t, i, np.asarray(x, dtype=float), inds[i],
-                          blk.ref) for i, x in enumerate(points)]
+                          blk.ref, pass_tag) for i, x in enumerate(points)]
                 results = self._map(backward_point_task, tasks)
             finally:
                 blk.close()
             self.n_solves += sum(len(s) for s in inds)
             new_cuts = []
-            for (_, _, _, x, _, _), (beta, obj) in zip(tasks, results):
+            for (_, _, _, x, _, _, _), (beta, obj) in zip(tasks, results):
                 c = Cut(float(obj) - float(beta @ x), beta, x, t, float(obj), it)
                 self.cuts[t].append(c)
                 new_cuts.append(c)
@@ -224,6 +237,11 @@ class SDDPEngine:
 
         删除是安全的：割集是下界的下包络近似，删掉若干条只会让近似变松（下界仍
         合法），不会让它失效。保留 `it == 0` 的平凡割以保证 theta 有下界。
+
+        高松弛阶段（replay.hybrid_stages）保留更多割：这些阶段正是割最松的地方，
+        LML1 的"每点只留一条"会把能抬升下界的新割挤掉。实现上仍先跑完整的 LML1，
+        再把最近 hybrid_keep_rounds 轮的割加回存活集；0 表示全部保留（跳过删除）。
+        这只改变保留集合，LML1 的数学逻辑不变。
         """
         pts, mx, rc = self._pts[t], self._mx[t], self._rc[t]
         n_old = len(pts)
@@ -235,6 +253,7 @@ class SDDPEngine:
         if n_old == 0 and len(pts) == 0:
             return
         M = np.asarray(mx, dtype=float).copy()        # 一次成型，避免逐条 vstack
+
         X = np.vstack(pts)
         tol = self.cut_select_eps * np.maximum(1.0, np.abs(M))
         for c in new_cuts:
@@ -252,6 +271,11 @@ class SDDPEngine:
             if len(pts) > keep_n:
                 del pts[:-keep_n], mx[:-keep_n], rc[:-keep_n]
         alive = {id(c) for c in rc}
+        if t in self.hybrid_stages and self.round_id >= self.hybrid_start:
+            if self.hybrid_keep_rounds <= 0:
+                return
+            cutoff = self.round_id - self.hybrid_keep_rounds
+            alive.update(id(c) for c in self.cuts[t] if c.it > cutoff)
         before = len(self.cuts[t])
         self.cuts[t] = [c for c in self.cuts[t]
                         if c.it == 0 or id(c) in alive]
@@ -273,6 +297,8 @@ class SDDPEngine:
         LML1 会删除未被任何试探点选中的割，因此当前 LB 可能下降；每个当前值仍是
         真问题的合法下界。历史最大值另存 `self.lb_best`，只作诊断/报告，本方法
         返回当前值，保持「LB = 当前割集的阶段 0 最优值」的语义。
+
+        `last_lb` 记录上一次求解值，供下一轮回放诊断当作 θ_0。
         """
         blk = put_cuts(self.cuts[1], self.state_dim)
         try:
@@ -281,6 +307,7 @@ class SDDPEngine:
             blk.close()
         self.n_solves += 1
         self.lb_best = max(self.lb_best, lb)
+        self.last_lb = lb
         return lb
 
     # -------------------------------------------------------------- 主循环
@@ -294,17 +321,25 @@ class SDDPEngine:
         try:
             for k in range(start_iter, start_iter + n_iter):
                 self.round_id = k
+                lb_before = self.last_lb
                 if trace:
                     log(f"  [轮 {k}] 前向 {self.cfg.n_forward_paths} 条路径 …")
-                trial, results = self.forward(self.cfg.n_forward_paths)
+                trial, results = self.forward(
+                    self.cfg.n_forward_paths,
+                    record="light" if self.replay is not None else False)
                 sim = float(np.mean([r[2] for r in results]))
                 n_fb = int(sum(r[4] for r in results))
                 if trace:
                     log(f"  [轮 {k}] 后向（{self.T} 期串行，每期 "
                         f"{len(trial[1])} 个试探点）…")
                 self.backward(trial, it=k)
-                if trace:
-                    log(f"  [轮 {k}] 下界 …")
+                rstats = {}
+                if self.replay is not None and k % self.replay.period == 0:
+                    if trace:
+                        log(f"  [轮 {k}] 跨阶段经验回放 …")
+                    rstats = self.replay.run(self, results, lb_before, k)
+                    if trace:
+                        log(f"  [轮 {k}] 下界 …")
                 lb = self.lower_bound()
                 self.last_iter = k
                 elapsed = time.time() - t0
@@ -313,17 +348,26 @@ class SDDPEngine:
                        "solves": self.n_solves, "mip_fallback": n_fb,
                        "n_cuts": sum(len(c) for c in self.cuts[1:]),
                        "n_dropped": self.n_cut_dropped}
+                rec.update(rstats)
                 history.append(rec)
                 if self.on_iter is not None:
                     self.on_iter(rec)
                 if verbose:
+                    rp = (f" | 回放 +{rstats['replay_cuts']} 割"
+                          f"（本地 {rstats['replay_local']} / 跨阶段 "
+                          f"{rstats['replay_cross']}）" if rstats else "")
                     log(f"  轮 {k:5d} | LB = {lb:14.4f} | 前向均值 = {sim:14.4f} "
                         f"| 割数 = {rec['n_cuts']:6d} | {elapsed:7.1f} s"
-                        + (f" | MIP 回退 {n_fb}" if n_fb else ""))
+                        + (f" | MIP 回退 {n_fb}" if n_fb else "") + rp)
                 if self.results_dir is not None and \
                         time.time() - last_ckpt >= self.checkpoint_interval:
                     self.checkpoint()
                     last_ckpt = time.time()
+                if self.max_train_seconds > 0 and \
+                        time.time() - t0 >= self.max_train_seconds:
+                    log(f"达到训练时限 {self.max_train_seconds:.0f} s："
+                        f"完成 {k} 轮后停止")
+                    break
         except KeyboardInterrupt:
             log("已中断，正在保存割 …")
         finally:
@@ -340,16 +384,19 @@ class SDDPEngine:
         return save_cuts(self.results_dir, self.cuts, self.meta())
 
     def meta(self) -> dict:
-        return {"T": self.T, "state_dim": self.state_dim, "seed": self.seed,
-                "model": "markov_grade",
-                "G": getattr(self.prob, "G", None),
-                "lambda0": getattr(self.prob, "lambda0", None),
-                "dirichlet_s": getattr(self.prob, "dirichlet_s", None),
-                "n_scenes": self.n_scenes,
-                "n_iterations": self.last_iter,
-                "n_cuts": sum(len(c) for c in self.cuts[1:]),
-                "n_solves": self.n_solves,
-                "lb_best": self.lb_best}
+        out = {"T": self.T, "state_dim": self.state_dim, "seed": self.seed,
+               "model": "markov_grade",
+               "G": getattr(self.prob, "G", None),
+               "lambda0": getattr(self.prob, "lambda0", None),
+               "dirichlet_s": getattr(self.prob, "dirichlet_s", None),
+               "n_scenes": self.n_scenes,
+               "n_iterations": self.last_iter,
+               "n_cuts": sum(len(c) for c in self.cuts[1:]),
+               "n_solves": self.n_solves,
+               "lb_best": self.lb_best}
+        if self.replay is not None:
+            out["replay"] = self.replay.meta()
+        return out
 
     def open_log(self, name: str = "sddp_training_log.csv") -> TrainingLog:
         if self.results_dir is None:

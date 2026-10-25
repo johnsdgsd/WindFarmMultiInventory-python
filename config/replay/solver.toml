@@ -1,0 +1,55 @@
+# T60 参数上的 DG-CSER 经验回放 A/B（基线见 results/base_T60_*）。
+# 训练/仿真参数与 config/solver.toml 一致，另设 120 s 检查点与 3600 s 时限。
+
+[training]
+iterations = 200
+forward_paths_per_process = 1
+n_backward_samples = 0
+checkpoint_interval = 120.0   # 1h 对照实验：最坏只丢最后 2 分钟
+max_train_seconds = 3600.0    # 固定墙钟 1h；到点优雅停止并落盘
+
+cut_selection = "lml1"
+cut_select_eps = 1e-6
+cut_select_keep_rounds = 0
+seed = 2026
+
+# T60 诊断（docs/创新-跨阶段经验回放机制.md）：
+#   高松弛阶段 37–44,48,53 以采购为主；54–55 以停机/被动调拨/持有为主。
+#   阶段 60 为末期，不参与回放；37–55 为高松弛带，从第 10 轮起有界保留割。
+[replay]
+enabled = true
+period = 10
+k_local = 10
+k_cross = 10
+coverage_quantile = 0.8
+max_pool = 1000
+diversity_eps = 0.05
+groups = [[37, 38, 39, 40, 41, 42, 43, 44, 48, 53], [54, 55]]
+group_labels = [["采购"], ["停机", "被动调拨", "持有"]]
+hybrid_stages = [37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55]
+# 诊断是时变的：静态组来自成熟模型，早期还会把当前 δ_t 最高的几个阶段加入本地回放。
+top_targets = 8
+# 静态组阶段从第 10 轮（首次回放）起做有界保留；更早轮次让 LML1 正常工作，
+# 避免在割还很粗糙时用大量弱割拖慢每个 LP。
+hybrid_start = 10
+hybrid_keep_rounds = 5   # 保留最近 5 轮 + LML1 选中的旧割；0 = 全部保留
+
+[parallel]
+n_processes = 0
+threads_per_process = 1
+
+[simulation]
+n_simulations = 2000
+chunk_size = 1000
+
+[numerics]
+feas_tol = 1e-6
+dual_tol = 1e-6
+int_tol = 1e-6
+presolve = -1
+mip_rel_gap = 0.001
+mip_time_limit = 20.0
+
+[output]
+tag = "base_T60_replay"
+results_root = "results"

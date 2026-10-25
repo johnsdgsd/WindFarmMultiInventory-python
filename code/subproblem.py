@@ -385,6 +385,24 @@ class StageSubproblem:
         out[Ly.off_n:Ly.off_n + Ly.n_n] = n_fixed.ravel()
         return out
 
+    def replay_values(self) -> dict:
+        """经验回放诊断所需的轻量快照：只读五项成本用得到的变量。
+
+        全量 decision_values() 每期要读上百个变量，600 个期-路径点会把训练拖慢
+        约 1.5 倍；回放只需要 I_out / y / taup / taum / theta，其余由状态算。
+        """
+        Ly = self.layout
+        flat = (list(self.x_out[:Ly.n_I]) + list(self.taup) + list(self.taum)
+                + [v for row in self.y for v in row])
+        vals = ce.values(self.model, flat)
+        nI, nR = Ly.n_I, Ly.N_R
+        I_out = vals[:nI]
+        taup = vals[nI:nI + nR]
+        taum = vals[nI + nR:nI + 2 * nR]
+        y = np.asarray(vals[nI + 2 * nR:], dtype=float).reshape(nR, nR).tolist()
+        return {"theta": self.theta_value(), "I_out": I_out,
+                "taup": taup, "taum": taum, "y": y}
+
     def decision_values(self) -> dict:
         """仿真记录用的决策快照。"""
         Ly = self.layout
