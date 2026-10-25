@@ -62,9 +62,18 @@ class SDDPEngine:
         self.n_processes = int(cfg.n_processes)
         self.results_dir = None if results_dir is None else Path(results_dir)
         self.checkpoint_interval = float(cfg.checkpoint_interval)
+        self.max_train_seconds = float(getattr(cfg, "max_train_seconds", 0.0))
+        self.forward_sampling = str(getattr(cfg, "forward_sampling", "random"))
         self.log = log if log is not None else (lambda *a, **k: None)
 
         self.n_scenes = len(prob.pool)
+        # 按每场景的总失效强度排序，stratified 前向按分位分层取场景
+        scores = []
+        G = int(getattr(prob, "G", 0))
+        for _, theta in prob.pool:
+            th = np.asarray(theta, dtype=float)
+            scores.append(float(th[:, :, G].sum(axis=1).mean()))
+        self.scene_order = np.argsort(np.asarray(scores))
         _k = int(getattr(cfg, "n_backward_samples", 0))
         if 0 < _k < self.n_scenes:
             self.log(
@@ -122,8 +131,16 @@ class SDDPEngine:
 
     # ------------------------------------------------------------ 前向 pass
     def sample_scene_paths(self, n_paths: int) -> list[list[int]]:
-        return [self.rng.integers(0, self.n_scenes, size=self.T).tolist()
-                for _ in range(n_paths)]
+        if self.forward_sampling != "stratified":
+            return [self.rng.integers(0, self.n_scenes, size=self.T).tolist()
+                    for _ in range(n_paths)]
+        # 每条路径负责一个失效强度分位层；层内按阶段独立抽样。
+        strata = np.array_split(self.scene_order, n_paths)
+        out = []
+        for stratum in strata:
+            pool = stratum if len(stratum) else self.scene_order
+            out.append(self.rng.choice(pool, size=self.T, replace=True).tolist())
+        return out
 
     def forward(self, n_paths: int, *, record: bool = False):
         """采样路径并求解。返回 (trial, results)。
@@ -324,6 +341,11 @@ class SDDPEngine:
                         time.time() - last_ckpt >= self.checkpoint_interval:
                     self.checkpoint()
                     last_ckpt = time.time()
+                if self.max_train_seconds > 0 and \
+                        time.time() - t0 >= self.max_train_seconds:
+                    log(f"达到训练时限 {self.max_train_seconds:.0f} s："
+                        f"完成 {k} 轮后停止")
+                    break
         except KeyboardInterrupt:
             log("已中断，正在保存割 …")
         finally:
