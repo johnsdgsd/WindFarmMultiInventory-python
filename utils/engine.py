@@ -62,6 +62,8 @@ class SDDPEngine:
         self.n_processes = int(cfg.n_processes)
         self.results_dir = None if results_dir is None else Path(results_dir)
         self.checkpoint_interval = float(cfg.checkpoint_interval)
+        self.max_train_seconds = float(getattr(cfg, "max_train_seconds", 0.0))
+        self.dedup_cuts = bool(getattr(cfg, "dedup_cuts", False))
         self.log = log if log is not None else (lambda *a, **k: None)
 
         self.n_scenes = len(prob.pool)
@@ -169,7 +171,8 @@ class SDDPEngine:
             if not points:
                 continue
             inds = self._sample_scenes(len(points))
-            blk = put_cuts(self.cuts[t + 1] if t < self.T else [], self.state_dim)
+            blk = put_cuts(self.cuts[t + 1] if t < self.T else [], self.state_dim,
+                           dedup=self.dedup_cuts)
             try:
                 tasks = [(self.round_id, t, i, np.asarray(x, dtype=float), inds[i],
                           blk.ref) for i, x in enumerate(points)]
@@ -274,7 +277,7 @@ class SDDPEngine:
         真问题的合法下界。历史最大值另存 `self.lb_best`，只作诊断/报告，本方法
         返回当前值，保持「LB = 当前割集的阶段 0 最优值」的语义。
         """
-        blk = put_cuts(self.cuts[1], self.state_dim)
+        blk = put_cuts(self.cuts[1], self.state_dim, dedup=self.dedup_cuts)
         try:
             lb = float(self._map(lower_bound_task, [(self.round_id, blk.ref)])[0])
         finally:
@@ -324,6 +327,11 @@ class SDDPEngine:
                         time.time() - last_ckpt >= self.checkpoint_interval:
                     self.checkpoint()
                     last_ckpt = time.time()
+                if self.max_train_seconds > 0 and \
+                        time.time() - t0 >= self.max_train_seconds:
+                    log(f"达到训练时限 {self.max_train_seconds:.0f} s："
+                        f"完成 {k} 轮后停止")
+                    break
         except KeyboardInterrupt:
             log("已中断，正在保存割 …")
         finally:
@@ -359,7 +367,8 @@ class SDDPEngine:
     # --------------------------------------------- 前向割块（仿真/外部复用）
     def forward_refs(self):
         """当前割表的每阶段 ref（前向路径任务用）。调用方负责 close。"""
-        return [put_cuts(self.cuts[t + 1], self.state_dim) for t in range(0, self.T)]
+        return [put_cuts(self.cuts[t + 1], self.state_dim, dedup=self.dedup_cuts)
+                for t in range(0, self.T)]
 
     # ------------------------------------------------------ 仿真用采样器
     def sim_scene_paths(self, n_paths: int, seed: int | None = None):

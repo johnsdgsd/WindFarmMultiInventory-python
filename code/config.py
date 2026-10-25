@@ -204,10 +204,12 @@ class SolverConfig:
     forward_paths_per_process: int
     n_backward_samples: int
     checkpoint_interval: float
+    max_train_seconds: float
     seed: int
     cut_selection: str
     cut_select_eps: float
     cut_select_keep_rounds: int
+    dedup_cuts: bool
     # 并行
     n_processes: int
     threads_per_process: int
@@ -258,6 +260,9 @@ class SolverConfig:
         if self.cut_select_keep_rounds < 0:
             raise ValueError(f"[training] cut_select_keep_rounds 不得为负，"
                              f"实际 {self.cut_select_keep_rounds}")
+        if self.max_train_seconds < 0:
+            raise ValueError(f"[training] max_train_seconds 不得为负（0 = 不限时），"
+                             f"实际 {self.max_train_seconds}")
         if self.threads_per_process < 1:
             raise ValueError(f"[parallel] threads_per_process 必须 ≥ 1，"
                              f"实际 {self.threads_per_process}")
@@ -277,7 +282,9 @@ class SolverConfig:
             f"训练   轮数 {self.iterations}  前向路径 {self.n_forward_paths}"
             f"（{self.forward_paths_per_process} × {self.n_processes} 进程）"
             f"  后向场景 {self.n_backward_samples or '全枚举'}"
-            f"  割筛选 {self.cut_selection}",
+            f"  割筛选 {self.cut_selection}"
+            f"  去重 {'开' if self.dedup_cuts else '关'}"
+            f"  时限 {self.max_train_seconds or '不限'} s",
             f"并行   进程 {self.n_processes}  每进程 COPT 线程 {self.threads_per_process}",
             f"仿真   路径 {self.n_simulations}  块大小 {self.chunk_size}",
             f"数值   FeasTol {self.feas_tol:g}  DualTol {self.dual_tol:g}  "
@@ -301,10 +308,13 @@ def load_solver_config(path, *, resolve: bool = True) -> SolverConfig:
             _req(tr, "forward_paths_per_process", "solver.toml/training")),
         n_backward_samples=int(_req(tr, "n_backward_samples", "solver.toml/training")),
         checkpoint_interval=float(_req(tr, "checkpoint_interval", "solver.toml/training")),
+        max_train_seconds=float(
+            _req(tr, "max_train_seconds", "solver.toml/training")),
         seed=int(_req(tr, "seed", "solver.toml/training")),
         cut_selection=str(_req(tr, "cut_selection", "solver.toml/training")),
         cut_select_eps=float(_req(tr, "cut_select_eps", "solver.toml/training")),
         cut_select_keep_rounds=int(_req(tr, "cut_select_keep_rounds", "solver.toml/training")),
+        dedup_cuts=bool(_req(tr, "dedup_cuts", "solver.toml/training")),
         n_processes=int(_req(pa, "n_processes", "solver.toml/parallel")),
         threads_per_process=int(_req(pa, "threads_per_process", "solver.toml/parallel")),
         n_simulations=int(_req(si, "n_simulations", "solver.toml/simulation")),
