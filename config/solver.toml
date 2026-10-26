@@ -13,6 +13,7 @@ forward_paths_per_process = 1
 # LB>前向均值）。设 0 后后向求解次数约为 1/k，500 轮约数小时。
 n_backward_samples = 0
 checkpoint_interval = 600.0   # 秒；训练中周期性落盘割
+max_train_seconds = 0.0       # 秒；0 = 不限时
 
 # 割筛选（docs/LML1割筛选算法逻辑.md）
 #   lml1：对每个历史试探点只保留"在该点取值最大、且生成最早"的那条割；没有被任何点
@@ -22,6 +23,17 @@ cut_selection = "lml1"
 cut_select_eps = 1e-6           # ε0：判断两个割值是否并列
 cut_select_keep_rounds = 0      # 试探点保留的轮数；0 = 全部保留（文档原版）
 seed = 2026
+
+# BL-SDDP：本阶段历史 trial 状态回放（docs/BL-SDDP.md）
+[bl]
+enabled = false
+# after  = 论文原意：先做标准后向，再额外回放历史点
+# unified = 当前试探点 + 历史点合并成一次后向（回放轮省一次标准后向）
+mode = "after"
+period = 5
+batch = 20
+selection = "random"   # random / recent / tight（论文 B 规则）
+memory = 200
 
 [parallel]
 n_processes = 0           # 0 = 自动（物理核数 // 2）；1 = 串行（调试用，traceback 完整）

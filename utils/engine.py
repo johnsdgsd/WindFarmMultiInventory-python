@@ -48,10 +48,12 @@ class SDDPEngine:
     results_dir   : 结果目录（求解失败时的现场 LP 落这里）
     """
 
-    def __init__(self, prob, make_sub, cfg, *, results_dir=None, log=print):
+    def __init__(self, prob, make_sub, cfg, *, results_dir=None, log=print,
+                 bl=None):
         self.prob = prob
         self.make_sub = make_sub
         self.cfg = cfg
+        self.bl = bl
         self.T = int(prob.T)
         self.state_dim = int(prob.state_dim)
         self.initial_state = np.round(
@@ -62,6 +64,7 @@ class SDDPEngine:
         self.n_processes = int(cfg.n_processes)
         self.results_dir = None if results_dir is None else Path(results_dir)
         self.checkpoint_interval = float(cfg.checkpoint_interval)
+        self.max_train_seconds = float(cfg.max_train_seconds)
         self.log = log if log is not None else (lambda *a, **k: None)
 
         self.n_scenes = len(prob.pool)
@@ -302,7 +305,22 @@ class SDDPEngine:
                 if trace:
                     log(f"  [轮 {k}] 后向（{self.T} 期串行，每期 "
                         f"{len(trial[1])} 个试探点）…")
-                self.backward(trial, it=k)
+                rstats = {}
+                if self.bl is not None and k % self.bl.period == 0:
+                    if self.bl.mode == "after":
+                        if trace:
+                            log(f"  [轮 {k}] 标准后向 + BL-SDDP 历史批回放 …")
+                        self.backward(trial, it=k)
+                        rstats = self.bl.replay(self, k)
+                    else:
+                        if trace:
+                            log(f"  [轮 {k}] BL-SDDP 批回放（当前+历史，单次后向）…")
+                        rstats = self.bl.replay(self, k, current=trial)
+                    self.bl.remember(trial, k, self.cuts)
+                else:
+                    self.backward(trial, it=k)
+                    if self.bl is not None:
+                        self.bl.remember(trial, k, self.cuts)
                 if trace:
                     log(f"  [轮 {k}] 下界 …")
                 lb = self.lower_bound()
@@ -313,17 +331,25 @@ class SDDPEngine:
                        "solves": self.n_solves, "mip_fallback": n_fb,
                        "n_cuts": sum(len(c) for c in self.cuts[1:]),
                        "n_dropped": self.n_cut_dropped}
+                rec.update(rstats)
                 history.append(rec)
                 if self.on_iter is not None:
                     self.on_iter(rec)
                 if verbose:
+                    rp = (f" | BL +{rstats['bl_cuts']} 割"
+                          f"（{rstats['bl_states']} 状态）" if rstats else "")
                     log(f"  轮 {k:5d} | LB = {lb:14.4f} | 前向均值 = {sim:14.4f} "
                         f"| 割数 = {rec['n_cuts']:6d} | {elapsed:7.1f} s"
-                        + (f" | MIP 回退 {n_fb}" if n_fb else ""))
+                        + (f" | MIP 回退 {n_fb}" if n_fb else "") + rp)
                 if self.results_dir is not None and \
                         time.time() - last_ckpt >= self.checkpoint_interval:
                     self.checkpoint()
                     last_ckpt = time.time()
+                if self.max_train_seconds > 0 and \
+                        time.time() - t0 >= self.max_train_seconds:
+                    log(f"达到训练时限 {self.max_train_seconds:.0f} s："
+                        f"完成 {k} 轮后停止")
+                    break
         except KeyboardInterrupt:
             log("已中断，正在保存割 …")
         finally:
@@ -340,16 +366,19 @@ class SDDPEngine:
         return save_cuts(self.results_dir, self.cuts, self.meta())
 
     def meta(self) -> dict:
-        return {"T": self.T, "state_dim": self.state_dim, "seed": self.seed,
-                "model": "markov_grade",
-                "G": getattr(self.prob, "G", None),
-                "lambda0": getattr(self.prob, "lambda0", None),
-                "dirichlet_s": getattr(self.prob, "dirichlet_s", None),
-                "n_scenes": self.n_scenes,
-                "n_iterations": self.last_iter,
-                "n_cuts": sum(len(c) for c in self.cuts[1:]),
-                "n_solves": self.n_solves,
-                "lb_best": self.lb_best}
+        out = {"T": self.T, "state_dim": self.state_dim, "seed": self.seed,
+               "model": "markov_grade",
+               "G": getattr(self.prob, "G", None),
+               "lambda0": getattr(self.prob, "lambda0", None),
+               "dirichlet_s": getattr(self.prob, "dirichlet_s", None),
+               "n_scenes": self.n_scenes,
+               "n_iterations": self.last_iter,
+               "n_cuts": sum(len(c) for c in self.cuts[1:]),
+               "n_solves": self.n_solves,
+               "lb_best": self.lb_best}
+        if self.bl is not None:
+            out["bl"] = self.bl.meta()
+        return out
 
     def open_log(self, name: str = "sddp_training_log.csv") -> TrainingLog:
         if self.results_dir is None:

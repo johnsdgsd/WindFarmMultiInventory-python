@@ -37,6 +37,7 @@ if _stack_after:
     faulthandler.dump_traceback_later(float(_stack_after), exit=True)
     print(f"[调试] {_stack_after} s 后会打印全部线程栈并退出")
 
+from code.bl_sddp import BatchLearning                              # noqa: E402
 from code.config import load_problem_config, load_solver_config     # noqa: E402
 from code.problem_data import DefineProblem, print_summary, to_json  # noqa: E402
 from code.subproblem import make_stage_subproblem                   # noqa: E402
@@ -77,6 +78,7 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
 
     prob = DefineProblem(pcfg)
     print_summary(prob)
+    bl = BatchLearning(prob, scfg, log=print) if scfg.bl_enabled else None
 
     t0 = time.time()
     if resume_dir is not None:
@@ -100,7 +102,8 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
 
     # 工作进程在建池时装配 results_dir（求解失败要往那里导出现场 LP），
     # 所以目录必须先定下来再建引擎。
-    eng = SDDPEngine(prob, make_stage_subproblem, scfg, results_dir=d, log=print)
+    eng = SDDPEngine(prob, make_stage_subproblem, scfg, results_dir=d, log=print,
+                     bl=bl)
     start_iter = 1
     try:
         if resume_dir is not None:
@@ -125,6 +128,9 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
             nd = rec.get("n_dropped", 0)
             if nd:
                 note += f" | 已筛除 {nd}"
+            if rec.get("bl_cuts"):
+                note += (f" | BL +{rec['bl_cuts']}"
+                         f"（{rec['bl_states']} 状态）")
             print(f"  轮 {rec['iter']:5d} | LB = {rec['lb']:14.4f} | "
                   f"前向均值 = {rec['sim']:14.4f} | 割数 = {rec['n_cuts']:6d} | "
                   f"{rec['time']:7.1f} s{note}")
