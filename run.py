@@ -39,6 +39,7 @@ if _stack_after:
 
 from code.config import load_problem_config, load_solver_config     # noqa: E402
 from code.problem_data import DefineProblem, print_summary, to_json  # noqa: E402
+from code.replay import CrossStageReplay                             # noqa: E402
 from code.subproblem import make_stage_subproblem                   # noqa: E402
 from utils import SDDPEngine, simulate                              # noqa: E402
 from utils.io import (archive_log, has_configs, load_cuts, new_run_dir,  # noqa: E402
@@ -77,6 +78,7 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
 
     prob = DefineProblem(pcfg)
     print_summary(prob)
+    replay = CrossStageReplay(prob, scfg, log=print) if scfg.replay_enabled else None
 
     t0 = time.time()
     if resume_dir is not None:
@@ -100,7 +102,8 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
 
     # 工作进程在建池时装配 results_dir（求解失败要往那里导出现场 LP），
     # 所以目录必须先定下来再建引擎。
-    eng = SDDPEngine(prob, make_stage_subproblem, scfg, results_dir=d, log=print)
+    eng = SDDPEngine(prob, make_stage_subproblem, scfg, results_dir=d, log=print,
+                     replay=replay)
     start_iter = 1
     try:
         if resume_dir is not None:
@@ -125,6 +128,9 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
             nd = rec.get("n_dropped", 0)
             if nd:
                 note += f" | 已筛除 {nd}"
+            if rec.get("replay_cuts"):
+                note += (f" | 回放 +{rec['replay_cuts']}"
+                         f"（本地 {rec['replay_local']}/跨 {rec['replay_cross']}）")
             print(f"  轮 {rec['iter']:5d} | LB = {rec['lb']:14.4f} | "
                   f"前向均值 = {rec['sim']:14.4f} | 割数 = {rec['n_cuts']:6d} | "
                   f"{rec['time']:7.1f} s{note}")

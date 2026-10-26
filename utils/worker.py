@@ -112,7 +112,10 @@ def forward_path_task(task):
             x = sub.out_state_vector()
             if t >= 1:
                 costs.append(sub.stage_cost())
-                if record:
+                if record == "light":
+                    records.append({**sub.replay_values(), "cost": costs[-1],
+                                    "scene": si})
+                elif record:
                     records.append({**sub.decision_values(), "cost": costs[-1],
                                     "scene": si})
     return states, costs, float(sum(costs)), records, 0
@@ -128,10 +131,10 @@ def backward_point_task(task):
     **一任务 = 一个试探点 = 一条割**（用户要求的最小产出单位）。返回 (beta, obj)，
     截距 alpha = obj − beta@x 由主管程算（x 只有主管程有）。
     """
-    round_id, t, trial_idx, x, scene_inds, ref = task
+    round_id, t, trial_idx, x, scene_inds, ref, pass_tag = task
     prob, dim = _W["prob"], _W["dim"]
     with pl.attached(ref) as cuts_next:
-        sub = _shared_sub(t, cuts_next, (round_id, t, "bwd"))
+        sub = _shared_sub(t, cuts_next, (round_id, t, pass_tag))
         sub.set_state(x)
         grads = np.empty((len(scene_inds), dim))
         objs = np.empty(len(scene_inds))

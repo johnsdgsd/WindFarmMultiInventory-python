@@ -95,9 +95,28 @@ def attached(ref):
             shm.close()
 
 
-def put_cuts(cuts, dim: int) -> StagePayload:
-    """[Cut] -> StagePayload。"""
+def _dedup_exact(alpha, beta):
+    """完全相同 beta 只保留 alpha 最大的一条；对 max 包络是精确等价的。"""
+    best = {}
+    order = []
+    for i, row in enumerate(beta):
+        key = row.tobytes()
+        j = best.get(key)
+        if j is None:
+            best[key] = i
+            order.append(key)
+        elif alpha[i] > alpha[j]:
+            best[key] = i
+    idx = np.asarray([best[k] for k in order], dtype=int)
+    return alpha[idx], beta[idx]
+
+
+def put_cuts(cuts, dim: int, *, dedup: bool = False) -> StagePayload:
+    """[Cut] -> StagePayload。dedup 只压缩跨进程载荷，不改规范割池。"""
     if not cuts:
         return StagePayload(np.zeros(0), np.zeros((0, dim)))
-    return StagePayload(np.array([c.alpha for c in cuts], dtype=float),
-                        np.vstack([c.beta for c in cuts]).astype(float))
+    alpha = np.array([c.alpha for c in cuts], dtype=float)
+    beta = np.vstack([c.beta for c in cuts]).astype(float)
+    if dedup and len(alpha) > 1:
+        alpha, beta = _dedup_exact(alpha, beta)
+    return StagePayload(alpha, beta)

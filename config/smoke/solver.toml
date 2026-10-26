@@ -5,10 +5,28 @@ iterations = 10
 forward_paths_per_process = 1     # 2 进程 × 1 = 2 条前向路径
 n_backward_samples = 0            # 0 = 全枚举（池只有 30 条，够快）
 checkpoint_interval = 600.0
+max_train_seconds = 0.0
 cut_selection = "lml1"
 cut_select_eps = 1e-6
 cut_select_keep_rounds = 0
+dedup_cuts = false
 seed = 2026
+
+# 冒烟默认关闭；test/_t_replay.py 会打开并套用 T=8 的组。
+[replay]
+enabled = false
+period = 2
+k_local = 3
+k_cross = 3
+coverage_quantile = 0.8
+max_pool = 100
+diversity_eps = 0.05
+groups = [[3, 4, 5], [6, 7]]
+group_labels = [["采购"], ["停机", "被动调拨", "持有"]]
+hybrid_stages = [3, 4, 5, 6, 7]
+top_targets = 2
+hybrid_start = 1
+hybrid_keep_rounds = 0
 
 [parallel]
 n_processes = 2                   # 2 进程：冒烟也走一趟多进程链路

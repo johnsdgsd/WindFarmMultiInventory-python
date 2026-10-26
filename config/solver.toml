@@ -13,6 +13,7 @@ forward_paths_per_process = 1
 # LB>前向均值）。设 0 后后向求解次数约为 1/k，500 轮约数小时。
 n_backward_samples = 0
 checkpoint_interval = 600.0   # 秒；训练中周期性落盘割
+max_train_seconds = 0.0       # 秒；0 = 不限时。>0 时到时限后优雅停止并落盘
 
 # 割筛选（docs/LML1割筛选算法逻辑.md）
 #   lml1：对每个历史试探点只保留"在该点取值最大、且生成最早"的那条割；没有被任何点
@@ -20,8 +21,29 @@ checkpoint_interval = 600.0   # 秒；训练中周期性落盘割
 #   none：不筛选（每条割无条件入库）
 cut_selection = "lml1"
 cut_select_eps = 1e-6           # ε0：判断两个割值是否并列
-cut_select_keep_rounds = 0      # 试探点保留的轮数；0 = 全部保留（文档原版）
+cut_select_keep_rounds = 0
+dedup_cuts = false      # 试探点保留的轮数；0 = 全部保留（文档原版）
 seed = 2026
+
+# DG-CSER 跨阶段经验回放（docs/创新-跨阶段经验回放机制.md）
+#   enabled=false 即标准 SDDP；enabled=true 时每隔 period 轮做一次：
+#   诊断各阶段割松弛 → 在高松弛阶段回放历史状态（本地 + 同组跨阶段）重新生成割。
+#   groups 按阶段划分且同组内共享成本标签；hybrid_stages 保留更多割
+#   （hybrid_start 起、保留最近 hybrid_keep_rounds 轮 + LML1 选中的旧割）。
+[replay]
+enabled = false
+period = 10
+k_local = 10
+k_cross = 10
+coverage_quantile = 0.8
+max_pool = 1000
+diversity_eps = 0.05
+groups = []
+group_labels = []
+hybrid_stages = []
+top_targets = 0          # 除静态组外，再按当前 δ_t 取前 N 个阶段做本地回放
+hybrid_start = 1         # 从第几轮开始在高松弛阶段保留割
+hybrid_keep_rounds = 0   # 0 = 全部保留；k>0 = 保留最近 k 轮的割 + LML1 选中的旧割
 
 [parallel]
 n_processes = 0           # 0 = 自动（物理核数 // 2）；1 = 串行（调试用，traceback 完整）
