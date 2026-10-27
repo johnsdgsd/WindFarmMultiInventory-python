@@ -26,6 +26,12 @@ def _req(d: dict, key: str, where: str):
     return d[key]
 
 
+def _opt(d: dict, key: str, default, where: str):
+    """可选键：只用于向后兼容的新增字段（旧结果目录的配置没有这些键）。
+    决定问题结构的参数仍必须走 _req，不得在代码里兜底。"""
+    return d[key] if key in d else default
+
+
 def _section(d: dict, name: str, where: str) -> dict:
     sec = _req(d, name, where)
     if not isinstance(sec, dict):
@@ -62,6 +68,8 @@ class ProblemConfig:
     state_repair_tol: float   # 只修正不超过该值的 Σn 超额（台）
     # 初始等级分布（长度 G、非负、和为 1）；[1,0,..] = 全新机队
     init_mix: list
+    # 各仓初始可用库存（长度 N_R，台）；旧配置缺省全 0
+    I0: list
     # 成本
     C: float
     h: float
@@ -124,6 +132,16 @@ class ProblemConfig:
         if abs(s - 1.0) > 1e-8:
             raise ValueError(f"[fleet] init_mix 必须和为 1，实际 {s}")
 
+        if len(self.I0) != self.N_R:
+            raise ValueError(f"[fleet] I0 长度 {len(self.I0)} ≠ N_R={self.N_R}")
+        if any(float(x) < 0 for x in self.I0):
+            raise ValueError(f"[fleet] I0 不得含负值：{self.I0}")
+        bad = [r + 1 for r, (x, cap) in enumerate(zip(self.I0, self.Imax))
+               if float(x) > float(cap)]
+        if bad:
+            raise ValueError(f"[fleet] I0 超过 Imax：仓库 {bad}，"
+                             f"I0={self.I0}, Imax={self.Imax}")
+
         if self.lambda0 <= 0:
             raise ValueError(f"[degradation] lambda0 必须为正，实际 {self.lambda0}")
         if self.dirichlet_s <= 0:
@@ -163,10 +181,11 @@ def load_problem_config(path) -> ProblemConfig:
     cov = _section(raw, "covariate", path.name)
     scen = _section(raw, "scenario", path.name)
     prio = raw.get("priority")
+    N_R = int(_req(dim, "N_R", "problem.toml/dimension"))
     return ProblemConfig(
         T=int(_req(dim, "T", "problem.toml/dimension")),
         G=int(_req(dim, "G", "problem.toml/dimension")),
-        N_R=int(_req(dim, "N_R", "problem.toml/dimension")),
+        N_R=N_R,
         L=int(_req(dim, "L", "problem.toml/dimension")),
         N=[int(v) for v in _req(fleet, "N", "problem.toml/fleet")],
         Qmax=[int(v) for v in _req(fleet, "Qmax", "problem.toml/fleet")],
@@ -177,6 +196,8 @@ def load_problem_config(path) -> ProblemConfig:
         state_repair_tol=float(_req(fleet, "state_repair_tol",
                                     "problem.toml/fleet")),
         init_mix=[float(v) for v in _req(fleet, "init_mix", "problem.toml/fleet")],
+        I0=[float(v) for v in _opt(fleet, "I0", [0.0] * N_R,
+                                   "problem.toml/fleet")],
         C=float(_req(cost, "C", "problem.toml/cost")),
         h=float(_req(cost, "h", "problem.toml/cost")),
         Cs=float(_req(cost, "Cs", "problem.toml/cost")),
@@ -204,6 +225,7 @@ class SolverConfig:
     forward_paths_per_process: int
     n_backward_samples: int
     checkpoint_interval: float
+    max_train_seconds: float
     seed: int
     cut_selection: str
     cut_select_eps: float
@@ -258,6 +280,9 @@ class SolverConfig:
         if self.cut_select_keep_rounds < 0:
             raise ValueError(f"[training] cut_select_keep_rounds 不得为负，"
                              f"实际 {self.cut_select_keep_rounds}")
+        if self.max_train_seconds < 0:
+            raise ValueError(f"[training] max_train_seconds 不得为负（0 = 不限），"
+                             f"实际 {self.max_train_seconds}")
         if self.threads_per_process < 1:
             raise ValueError(f"[parallel] threads_per_process 必须 ≥ 1，"
                              f"实际 {self.threads_per_process}")
@@ -277,7 +302,8 @@ class SolverConfig:
             f"训练   轮数 {self.iterations}  前向路径 {self.n_forward_paths}"
             f"（{self.forward_paths_per_process} × {self.n_processes} 进程）"
             f"  后向场景 {self.n_backward_samples or '全枚举'}"
-            f"  割筛选 {self.cut_selection}",
+            f"  割筛选 {self.cut_selection}"
+            f"  时限 {self.max_train_seconds or '不限'} s",
             f"并行   进程 {self.n_processes}  每进程 COPT 线程 {self.threads_per_process}",
             f"仿真   路径 {self.n_simulations}  块大小 {self.chunk_size}",
             f"数值   FeasTol {self.feas_tol:g}  DualTol {self.dual_tol:g}  "
@@ -301,6 +327,8 @@ def load_solver_config(path, *, resolve: bool = True) -> SolverConfig:
             _req(tr, "forward_paths_per_process", "solver.toml/training")),
         n_backward_samples=int(_req(tr, "n_backward_samples", "solver.toml/training")),
         checkpoint_interval=float(_req(tr, "checkpoint_interval", "solver.toml/training")),
+        max_train_seconds=float(_opt(tr, "max_train_seconds", 0.0,
+                                     "solver.toml/training")),
         seed=int(_req(tr, "seed", "solver.toml/training")),
         cut_selection=str(_req(tr, "cut_selection", "solver.toml/training")),
         cut_select_eps=float(_req(tr, "cut_select_eps", "solver.toml/training")),

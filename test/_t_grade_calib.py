@@ -39,11 +39,12 @@ def main() -> None:
     ])
     assert np.allclose(P, expected, atol=1e-12), P
 
-    # ---- 20 年失效率/首达 ----
-    pT = cumulative_failure_prob(P, 240, prob.init_mix)
+    # ---- 20 年失效率/首达（标定口径固定为「全新机队」，与实验的 init_mix 无关）----
+    fresh = np.array([1.0, 0.0, 0.0, 0.0])
+    pT = cumulative_failure_prob(P, 240, fresh)
     P_exact = transition_matrix(prob.lambda0, G, None)
-    pT_exact = cumulative_failure_prob(P_exact, 240, prob.init_mix)
-    mttf = expected_first_passage(P, prob.init_mix)
+    pT_exact = cumulative_failure_prob(P_exact, 240, fresh)
+    mttf = expected_first_passage(P, fresh)
     assert 0.0893 <= pT <= 0.0897, pT
     assert 0.0900 <= pT_exact <= 0.0904, pT_exact
     assert 560.0 <= mttf <= 580.0, mttf
@@ -51,7 +52,7 @@ def main() -> None:
     # ---- 状态维/初值 ----
     assert prob.state_dim == prob.N_R * (G + prob.L + 1) == 40
     assert np.allclose(prob.n0.sum(axis=1), prob.N)
-    assert np.allclose(prob.n0[:, 0], prob.N)
+    assert np.allclose(prob.n0, np.outer(prob.N, prob.init_mix))
 
     # ---- 池 ----
     theta_bar = _pool_mean_theta(prob.pool, prob.N_R, G)

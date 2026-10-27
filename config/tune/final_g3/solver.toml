@@ -1,0 +1,50 @@
+# 求解参数：SDDP 引擎与 COPT
+#
+# 默认值只写在这一份文件里，代码里没有第二处默认值 —— 改这里必定生效。
+# 训练时本文件会被原样拷贝进结果目录。
+
+[training]
+iterations = 9999
+# 前向采样路径数 = forward_paths_per_process × n_processes（解析后的实际进程数）。
+# 保持 1 倍 ⇒ 每阶段试探点数恰好等于进程数 ⇒ 每个 worker 每阶段正好产出 1 条割。
+forward_paths_per_process = 1
+# 后向每试探点采样的场景数。**要得到对全池有效的下界，必须设 0（全枚举）**：
+# k>0 时割只对抽到的 k 条场景子集成立，LB 可能高于全池 UB（本次 30/300 就出现了
+# LB>前向均值）。设 0 后后向求解次数约为 1/k，500 轮约数小时。
+n_backward_samples = 0
+checkpoint_interval = 300
+max_train_seconds = 3600
+
+# 割筛选（docs/LML1割筛选算法逻辑.md）
+#   lml1：对每个历史试探点只保留"在该点取值最大、且生成最早"的那条割；没有被任何点
+#         选中的割直接删除。割数由「轮数 × 路径数」的线性增长变成"被选中的割"数量。
+#   none：不筛选（每条割无条件入库）
+cut_selection = "lml1"
+cut_select_eps = 1e-6           # ε0：判断两个割值是否并列
+cut_select_keep_rounds = 0      # 试探点保留的轮数；0 = 全部保留（文档原版）
+seed = 2026
+
+[parallel]
+n_processes = 0           # 0 = 自动（物理核数 // 2）；1 = 串行（调试用，traceback 完整）
+threads_per_process = 1   # COPT 的 Threads。多进程下必须为 1：
+                          # 实测 3000 变量 LP 单线程 0.020 s vs 自动 0.040 s
+
+[simulation]
+n_simulations = 50
+chunk_size = 50
+
+[numerics]
+# COPT 容差（默认值即 COPT 默认，见 COPT使用手册.md §8.1）
+feas_tol = 1e-6           # 变量/约束取值的可行性容差
+dual_tol = 1e-6           # 对偶解的可行性容差
+int_tol = 1e-6            # 变量的整数解容差
+presolve = -1             # -1 自动；0 关；1 少量快；2 正常；3 多多益善
+# 前向 MIP 的收敛控制：前向只要一条**可行**策略（给上界 + 产试探点），不需要精确最优，
+# 而分支定界为了把 gap 收到默认 1e-4 会在某些状态上爆炸（实测第 115 期 15 s 出不来、
+# RSS 1.8 GB）。放宽 gap + 设时限后同一处瞬时返回。割仍来自后向 LP，始终是合法下界。
+mip_rel_gap = 0.001       # MIP 相对 gap 容忍（0.1%）
+mip_time_limit = 20.0     # 单次 MIP 时限（秒）；到时限但有可行解就采用
+
+[output]
+tag = "final_g3"
+results_root = "results"

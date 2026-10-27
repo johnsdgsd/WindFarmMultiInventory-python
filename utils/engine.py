@@ -62,6 +62,7 @@ class SDDPEngine:
         self.n_processes = int(cfg.n_processes)
         self.results_dir = None if results_dir is None else Path(results_dir)
         self.checkpoint_interval = float(cfg.checkpoint_interval)
+        self.max_train_seconds = float(getattr(cfg, "max_train_seconds", 0.0))
         self.log = log if log is not None else (lambda *a, **k: None)
 
         self.n_scenes = len(prob.pool)
@@ -324,6 +325,11 @@ class SDDPEngine:
                         time.time() - last_ckpt >= self.checkpoint_interval:
                     self.checkpoint()
                     last_ckpt = time.time()
+                if self.max_train_seconds > 0 and \
+                        time.time() - t0 >= self.max_train_seconds:
+                    log(f"达到训练时限 {self.max_train_seconds:.0f} s："
+                        f"完成 {k} 轮后停止")
+                    break
         except KeyboardInterrupt:
             log("已中断，正在保存割 …")
         finally:

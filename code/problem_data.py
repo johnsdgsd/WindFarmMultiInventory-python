@@ -237,6 +237,7 @@ def DefineProblem(cfg: ProblemConfig) -> ProblemData:
     Qmax = np.asarray(cfg.Qmax, dtype=np.int64)
     Imax = np.asarray(cfg.Imax, dtype=np.int64)
     init_mix = np.asarray(cfg.init_mix, dtype=float)
+    I0 = np.asarray(cfg.I0, dtype=float)
     beta_cov = np.asarray(cfg.beta_cov, dtype=float)
     z_bar = np.asarray(cfg.z_bar, dtype=float)
     cov = dict(cfg.cov)
@@ -245,13 +246,16 @@ def DefineProblem(cfg: ProblemConfig) -> ProblemData:
         raise ValueError(f"init_mix 长度 {len(init_mix)} ≠ G={G}")
     if np.any(init_mix < 0) or abs(float(init_mix.sum()) - 1.0) > 1e-8:
         raise ValueError(f"init_mix 必须非负且和为 1，实际 {init_mix.tolist()}")
+    if len(I0) != N_R or np.any(I0 < 0):
+        raise ValueError(f"I0 必须是非负、长度 {N_R} 的列表，实际 {I0.tolist()}")
+    if np.any(I0 > Imax):
+        raise ValueError(f"I0 不得超过 Imax：I0={I0.tolist()}, Imax={Imax.tolist()}")
 
     priority = default_priority(N_R) if cfg.priority is None else cfg.priority
     tc_route = make_tc_route(priority, cfg.tc, N_R)
 
     # 初始等级分布：每仓 N_r * init_mix
     n0 = np.outer(N.astype(float), init_mix)
-    I0 = np.zeros(N_R, dtype=float)
     o0 = np.zeros((L - 1, N_R), dtype=float)
     for r in range(N_R):
         if abs(float(n0[r].sum()) - float(N[r])) > 1e-8:
@@ -344,7 +348,8 @@ def print_summary(prob: ProblemData, out=print) -> None:
     out(f"T = {prob.T}  G = {G}  N_R = {prob.N_R}  L = {prob.L}  "
         f"pool = {len(prob.pool)}  seed = {prob.seed}  状态维 = {prob.state_dim}")
     out(f"机队 N = {prob.N.tolist()}  总数 = {int(prob.N.sum())}  "
-        f"init_mix = {prob.init_mix.tolist()}  fleet_tol = {prob.fleet_tol:g}  "
+        f"init_mix = {prob.init_mix.tolist()}  I0 = {prob.I0.tolist()}  "
+        f"fleet_tol = {prob.fleet_tol:g}  "
         f"state_round_digits = {prob.state_round_digits}  "
         f"state_repair_tol = {prob.state_repair_tol:g}")
     out(f"成本: C={prob.C}  h={prob.h}  Cs={prob.Cs}  atc={prob.atc}  tc={prob.tc}")

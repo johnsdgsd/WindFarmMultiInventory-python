@@ -13,6 +13,7 @@ forward_paths_per_process = 1
 # LB>前向均值）。设 0 后后向求解次数约为 1/k，500 轮约数小时。
 n_backward_samples = 0
 checkpoint_interval = 600.0   # 秒；训练中周期性落盘割
+max_train_seconds = 0         # 墙钟训练时限（秒）；0 = 不限。到时限后当前轮结束即停并存割。
 
 # 割筛选（docs/LML1割筛选算法逻辑.md）
 #   lml1：对每个历史试探点只保留"在该点取值最大、且生成最早"的那条割；没有被任何点
