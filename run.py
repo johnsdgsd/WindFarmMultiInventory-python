@@ -107,6 +107,7 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
             cuts, meta = load_cuts(d, prob.T, prob.state_dim)
             eng.cuts = cuts
             eng.lb_best = float(meta.get("lb_best", 0.0))
+            eng.load_partition_state(meta)
             if eng.cut_selection == "lml1":
                 n_hist = eng.restore_cut_history()
                 print(f"LML1 历史已从割的 state 重建：{n_hist} 条记录")
@@ -125,6 +126,10 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
             nd = rec.get("n_dropped", 0)
             if nd:
                 note += f" | 已筛除 {nd}"
+            if eng.partition_enabled:
+                note += (f" | refines={rec.get('n_refines', 0)}"
+                         f" Lmean={rec.get('L_mean', 0):.1f}"
+                         f" Lmax={rec.get('L_max', 0)}")
             print(f"  轮 {rec['iter']:5d} | LB = {rec['lb']:14.4f} | "
                   f"前向均值 = {rec['sim']:14.4f} | 割数 = {rec['n_cuts']:6d} | "
                   f"{rec['time']:7.1f} s{note}")
@@ -160,6 +165,12 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
             "逐期平均成本（第 1..T 期）：",
             "  " + " ".join(f"{v:.4g}" for v in stage),
         ]
+        if eng.partition_enabled:
+            ls = [len(eng.partitions[t]) for t in range(1, eng.T + 1)]
+            lines.insert(-3, f"分区        : {eng.pcfg.describe()}")
+            lines.insert(-3, f"细化次数    : {eng.n_refines}")
+            lines.insert(-3, f"簇数        : mean={sum(ls) / len(ls):.2f} "
+                             f"max={max(ls)} min={min(ls)}")
         print("\n".join(lines))
         save_summary(d, "\n".join(lines) + "\n")
         eng.checkpoint()

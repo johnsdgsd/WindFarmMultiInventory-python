@@ -24,6 +24,24 @@ cut_select_eps = 1e-6           # ε0：判断两个割值是否并列
 cut_select_keep_rounds = 0      # 试探点保留的轮数；0 = 全部保留（文档原版）
 seed = 2026
 
+# 自适应分区/ITER-SDDP（docs/自适应分区SDDP.md）
+# enabled=false 时行为与旧版完全一致；旧结果目录没有这一节，loader 用兼容默认关闭。
+[partition]
+enabled = false
+cut_mode = "single"          # 本阶段只实现 single；multi 留给第二阶段
+adaptive = true
+initial_clusters = 1
+signature = "pi"             # pi=严格文档；beta=敏感性对照
+eps_sig = 0.0                # 绝对阈值；0 = 用 eps_sig_rel
+eps_sig_rel = 0.1            # 每阶段签名两两距离中位数的倍数
+eps_obj = 0.0                # Q 差值阈值（成本单位）
+stall_window = 10
+stall_rtol = 1.0e-3
+stall_abs = 1.0
+warmup_rounds = 10
+max_clusters = 0             # 0 = 不限；实验用 16/32
+refine_points = 1
+
 [parallel]
 n_processes = 0           # 0 = 自动（物理核数 // 2）；1 = 串行（调试用，traceback 完整）
 threads_per_process = 1   # COPT 的 Threads。多进程下必须为 1：

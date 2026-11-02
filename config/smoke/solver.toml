@@ -11,6 +11,22 @@ cut_select_eps = 1e-6
 cut_select_keep_rounds = 0
 seed = 2026
 
+[partition]
+enabled = false
+cut_mode = "single"
+adaptive = true
+initial_clusters = 1
+signature = "pi"
+eps_sig = 0.0
+eps_sig_rel = 0.1
+eps_obj = 0.0
+stall_window = 3
+stall_rtol = 1.0e-3
+stall_abs = 1.0
+warmup_rounds = 0
+max_clusters = 0
+refine_points = 1
+
 [parallel]
 n_processes = 2                   # 2 进程：冒烟也走一趟多进程链路
 threads_per_process = 1

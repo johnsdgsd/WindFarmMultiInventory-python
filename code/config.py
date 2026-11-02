@@ -219,6 +219,71 @@ def load_problem_config(path) -> ProblemConfig:
 
 # ------------------------------------------------------------------ 求解配置
 @dataclass
+class PartitionConfig:
+    """自适应分区（ITER-SDDP）参数。
+
+    这里的默认值只用于兼容**没有 [partition] 节的旧结果目录**（simulate/resume 要能读回
+    旧配置）；新配置必须在 solver.toml 里显式写全。本轮只实现 cut_mode="single"。
+    """
+
+    enabled: bool = False
+    cut_mode: str = "single"       # single=单粗割；multi 留给第二阶段
+    adaptive: bool = True
+    initial_clusters: int = 1
+    signature: str = "pi"          # pi=严格文档；beta=敏感性对照
+    eps_sig: float = 0.0           # 绝对签名距离阈值；0=用 eps_sig_rel
+    eps_sig_rel: float = 0.1       # 每阶段签名两两距离中位数的倍数
+    eps_obj: float = 0.0           # Q 差值阈值
+    stall_window: int = 10
+    stall_rtol: float = 1.0e-3
+    stall_abs: float = 1.0
+    warmup_rounds: int = 10
+    max_clusters: int = 0          # 0=不限
+    refine_points: int = 1
+
+    def __post_init__(self) -> None:
+        if self.cut_mode not in ("single", "multi"):
+            raise ValueError(f"[partition] cut_mode 只能是 single/multi，"
+                             f"实际 {self.cut_mode!r}")
+        if self.enabled and self.cut_mode == "multi":
+            raise NotImplementedError(
+                "[partition] cut_mode='multi' 本阶段未实现；先用 single，"
+                "多割在第二阶段单独实现")
+        if self.signature not in ("pi", "beta"):
+            raise ValueError(f"[partition] signature 只能是 pi/beta，"
+                             f"实际 {self.signature!r}")
+        if self.initial_clusters < 1:
+            raise ValueError(f"[partition] initial_clusters 必须 ≥1，"
+                             f"实际 {self.initial_clusters}")
+        if self.refine_points != 1:
+            raise ValueError(f"[partition] refine_points 首版只支持 1，"
+                             f"实际 {self.refine_points}")
+        if self.eps_sig < 0 or self.eps_sig_rel < 0 or self.eps_obj < 0:
+            raise ValueError("[partition] eps_sig/eps_sig_rel/eps_obj 不得为负")
+        if self.stall_window < 1:
+            raise ValueError(f"[partition] stall_window 必须 ≥1，"
+                             f"实际 {self.stall_window}")
+        if self.stall_rtol < 0 or self.stall_abs < 0:
+            raise ValueError("[partition] stall_rtol/stall_abs 不得为负")
+        if self.warmup_rounds < 0:
+            raise ValueError("[partition] warmup_rounds 不得为负")
+        if self.max_clusters < 0:
+            raise ValueError(f"[partition] max_clusters 不得为负（0=不限），"
+                             f"实际 {self.max_clusters}")
+        if self.enabled and not (self.eps_sig > 0 or self.eps_sig_rel > 0):
+            raise ValueError("[partition] enabled=true 时必须给 eps_sig>0 或 eps_sig_rel>0")
+
+    def describe(self) -> str:
+        if not self.enabled:
+            return "off"
+        eps = (f"eps_sig={self.eps_sig:g}" if self.eps_sig > 0
+               else f"eps_sig_rel={self.eps_sig_rel:g}")
+        return (f"on  mode={self.cut_mode} sig={self.signature} {eps} "
+                f"eps_obj={self.eps_obj:g} K0={self.initial_clusters} "
+                f"n={self.stall_window} maxK={self.max_clusters or 'inf'}")
+
+
+@dataclass
 class SolverConfig:
     # 训练
     iterations: int
@@ -230,6 +295,7 @@ class SolverConfig:
     cut_selection: str
     cut_select_eps: float
     cut_select_keep_rounds: int
+    partition: PartitionConfig
     # 并行
     n_processes: int
     threads_per_process: int
@@ -296,6 +362,10 @@ class SolverConfig:
         if self.mip_time_limit <= 0:
             raise ValueError(f"[numerics] mip_time_limit 必须为正，"
                              f"实际 {self.mip_time_limit}")
+        if self.partition.enabled and self.n_backward_samples != 0:
+            raise ValueError(
+                "[partition] enabled=true 时必须 n_backward_samples=0（全池枚举）；"
+                "场景子采样割只对子样本成立，不能冒充全池下界")
 
     def describe(self) -> str:
         return "\n".join([
@@ -304,6 +374,7 @@ class SolverConfig:
             f"  后向场景 {self.n_backward_samples or '全枚举'}"
             f"  割筛选 {self.cut_selection}"
             f"  时限 {self.max_train_seconds or '不限'} s",
+            f"分区   {self.partition.describe() if hasattr(self.partition, 'describe') else ('on' if self.partition.enabled else 'off')}",
             f"并行   进程 {self.n_processes}  每进程 COPT 线程 {self.threads_per_process}",
             f"仿真   路径 {self.n_simulations}  块大小 {self.chunk_size}",
             f"数值   FeasTol {self.feas_tol:g}  DualTol {self.dual_tol:g}  "
@@ -321,6 +392,30 @@ def load_solver_config(path, *, resolve: bool = True) -> SolverConfig:
     si = _section(raw, "simulation", path.name)
     nu = _section(raw, "numerics", path.name)
     ou = _section(raw, "output", path.name)
+    # [partition] 是新增节：旧结果目录没有它，用兼容默认（关闭）读回。
+    pt = raw.get("partition")
+    if pt is None:
+        partition = PartitionConfig()
+    else:
+        if not isinstance(pt, dict):
+            raise TypeError(f"配置 {path.name} 的 [partition] 必须是表")
+        w = "solver.toml/partition"
+        partition = PartitionConfig(
+            enabled=bool(_req(pt, "enabled", w)),
+            cut_mode=str(_req(pt, "cut_mode", w)),
+            adaptive=bool(_req(pt, "adaptive", w)),
+            initial_clusters=int(_req(pt, "initial_clusters", w)),
+            signature=str(_req(pt, "signature", w)),
+            eps_sig=float(_req(pt, "eps_sig", w)),
+            eps_sig_rel=float(_req(pt, "eps_sig_rel", w)),
+            eps_obj=float(_req(pt, "eps_obj", w)),
+            stall_window=int(_req(pt, "stall_window", w)),
+            stall_rtol=float(_req(pt, "stall_rtol", w)),
+            stall_abs=float(_req(pt, "stall_abs", w)),
+            warmup_rounds=int(_req(pt, "warmup_rounds", w)),
+            max_clusters=int(_req(pt, "max_clusters", w)),
+            refine_points=int(_req(pt, "refine_points", w)),
+        )
     cfg = SolverConfig(
         iterations=int(_req(tr, "iterations", "solver.toml/training")),
         forward_paths_per_process=int(
@@ -333,6 +428,7 @@ def load_solver_config(path, *, resolve: bool = True) -> SolverConfig:
         cut_selection=str(_req(tr, "cut_selection", "solver.toml/training")),
         cut_select_eps=float(_req(tr, "cut_select_eps", "solver.toml/training")),
         cut_select_keep_rounds=int(_req(tr, "cut_select_keep_rounds", "solver.toml/training")),
+        partition=partition,
         n_processes=int(_req(pa, "n_processes", "solver.toml/parallel")),
         threads_per_process=int(_req(pa, "threads_per_process", "solver.toml/parallel")),
         n_simulations=int(_req(si, "n_simulations", "solver.toml/simulation")),

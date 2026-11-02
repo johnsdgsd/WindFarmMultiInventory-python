@@ -90,6 +90,8 @@ class StageSubproblem:
         self._last_mip = False
         self._link_rows = {}
         self._build()
+        # base 行句柄在挂割之前缓存；dual_signature 只取这些行，不受以后 cut_* 行影响。
+        self._base_rows = list(self.model.getConstrs())
 
     # -------------------------------------------------------------- base 构建
     def _build(self) -> None:
@@ -428,6 +430,18 @@ class StageSubproblem:
                 g += a_c * pi
             return g
         raise ValueError(f"未知 method: {method}")
+
+    def dual_signature(self) -> np.ndarray:
+        """场景签名：只取 base 约束（不含 cut_* 行）的最优对偶。
+
+        文档的绝对分裂规则用 π；这里返回固定行序的 base 对偶向量。调用前必须已 solve_lp。
+        """
+        if self.is_virtual or not self._base_rows:
+            return np.zeros(0)
+        if self._last_mip:
+            raise RuntimeError(f"stage {self.t}：MIP 下取不到对偶，请先 solve_lp")
+        vals = self.model.getInfo(COPT.Info.Dual, self._base_rows)
+        return np.asarray(vals, dtype=float)
 
     def _row(self, name):
         if name not in self._rows:

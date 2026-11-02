@@ -146,6 +146,58 @@ def backward_point_task(task):
     return grads.mean(axis=0), float(objs.mean())
 
 
+# ------------------------------------------------ 自适应分区：后向粗割
+def backward_cluster_task(task):
+    """一个试探点的分区后向：每簇用聚合 Theta 解一个 LP，再按簇概率加权成一条割。
+
+    文档 §2.4/§2.6：固定补偿下 Q(x,ξ) 对 ξ 凸，故 E[Q] >= Σ p_l Q(x, E[ξ|P_l])；
+    返回加权后的 (beta, obj) 作为**一条**粗割。绝不能把每簇结果分别挂到同一个 theta。
+    """
+    from .partition import aggregate_theta
+
+    round_id, t, trial_idx, x, clusters, weights, ref = task
+    prob, dim = _W["prob"], _W["dim"]
+    beta = np.zeros(dim, dtype=float)
+    obj = 0.0
+    with pl.attached(ref) as cuts_next:
+        sub = _shared_sub(t, cuts_next, (round_id, t, "bwd_cluster"))
+        sub.set_state(x)
+        for inds, w in zip(clusters, weights):
+            th = aggregate_theta(prob.pool, inds)
+            sub.set_scene((None, th))
+            try:
+                sub.solve_lp()
+            except Exception as exc:
+                raise _fail("backward_cluster", t, int(inds[0]), sub, exc)
+            beta += float(w) * sub.gradient("dj")
+            obj += float(w) * sub.obj
+    return beta, float(obj)
+
+
+def scene_signatures_task(task):
+    """细化 Step 2：对一批原始场景逐场景解 LP，返回签名（pi 或 beta）和 Q。"""
+    round_id, t, trial_idx, x, scene_inds, ref = task
+    prob = _W["prob"]
+    sig_mode = getattr(_W["cfg"].partition, "signature", "pi")
+    sigs, objs = [], []
+    with pl.attached(ref) as cuts_next:
+        sub = _shared_sub(t, cuts_next, (round_id, t, "refine"))
+        sub.set_state(x)
+        for si in scene_inds:
+            sub.set_scene(prob.pool[int(si)])
+            try:
+                sub.solve_lp()
+            except Exception as exc:
+                raise _fail("refine", t, int(si), sub, exc)
+            if sig_mode == "pi":
+                sigs.append(sub.dual_signature())
+            else:
+                sigs.append(sub.gradient("dj"))
+            objs.append(float(sub.obj))
+    return np.asarray(scene_inds, dtype=int), np.asarray(sigs, dtype=float), \
+        np.asarray(objs, dtype=float)
+
+
 # ---------------------------------------------------------------- 下界任务
 def lower_bound_task(task):
     """阶段 0 子问题解 LP。割只增不减 ⇒ 下界单调不减，且不依赖随机数。"""
