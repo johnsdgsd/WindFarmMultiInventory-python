@@ -4,6 +4,7 @@
 # 训练时本文件会被原样拷贝进结果目录。
 
 [training]
+mode = "single"           # single=单割；multi=每个场景一条割/一个 theta（K=n_scenes）
 iterations = 200          # 训练轮数
 # 前向采样路径数 = forward_paths_per_process × n_processes（解析后的实际进程数）。
 # 保持 1 倍 ⇒ 每阶段试探点数恰好等于进程数 ⇒ 每个 worker 每阶段正好产出 1 条割。

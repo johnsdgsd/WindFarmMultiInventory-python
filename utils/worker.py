@@ -1,4 +1,5 @@
-# worker.py — spawn worker 的装配、长驻模型缓存与三类任务函数。与问题解耦。
+# worker.py — spawn worker 的装配、长驻模型缓存与任务函数。与问题解耦。
+# single 用 backward_point_task；multi 用 backward_multicut_task。
 """问题侧通过 `make_sub(t, prob, cfg) -> 子问题` 工厂注入，utils 不 import code/。
 
 **模型缓存（2 个模型/worker）**：
@@ -144,6 +145,29 @@ def backward_point_task(task):
             grads[k] = sub.gradient("dj")
             objs[k] = sub.obj
     return grads.mean(axis=0), float(objs.mean())
+
+
+def backward_multicut_task(task):
+    """标准多割：一个试探点对每个场景产出一条割，不平均。
+
+    返回 betas (K,dim), objs (K,)；group=k（场景索引）由主管程写入 Cut。
+    """
+    round_id, t, trial_idx, x, scene_inds, ref = task
+    prob, dim = _W["prob"], _W["dim"]
+    with pl.attached(ref) as cuts_next:
+        sub = _shared_sub(t, cuts_next, (round_id, t, "bwd_multi"))
+        sub.set_state(x)
+        grads = np.empty((len(scene_inds), dim))
+        objs = np.empty(len(scene_inds))
+        for k, si in enumerate(scene_inds):
+            sub.set_scene(prob.pool[si])
+            try:
+                sub.solve_lp()
+            except Exception as exc:
+                raise _fail("backward_multicut", t, si, sub, exc)
+            grads[k] = sub.gradient("dj")
+            objs[k] = sub.obj
+    return grads, objs
 
 
 # ---------------------------------------------------------------- 下界任务

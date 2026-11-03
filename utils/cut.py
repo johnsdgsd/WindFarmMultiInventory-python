@@ -17,9 +17,11 @@ import numpy as np
 # v2 → v3：月龄/Beta/F=rint → 等级/Poisson/Dirichlet/N=Θn 的纯 LP 模型；
 # v3 → v4：fleet/dem 右端增加 fleet_tol（纯 LP 浮点容差），可行域改变；
 # v4 → v5：状态流转增加 n 块 round + 小超额修复（state_round_digits/state_repair_tol）。
+# v5 → v6：多割 Cut 增加 group（场景/theta 索引）；single 仍为 group=0。
 # 各版割**语义不同、不可混用** —— load_cuts 会据此拦下旧目录，落实铁律 4
 # （模型改过就必须全新训练）。此后任何约束/状态/目标的改动都要再 +1。
-FORMAT_VERSION = 5
+FORMAT_VERSION = 6
+LEGACY_SINGLE_VERSION = 5   # v5 无 group；仅在 mode=single 时只读兼容
 
 
 @dataclass
@@ -33,8 +35,9 @@ class Cut:
     beta  : 次梯度 ∂Q/∂x，与状态向量同序、同维
     state : 生成该割的 backward 试验点（只作留痕：复现、剪枝、策略分析用）
     stage : 生成时所在的期（割近似的是 V_stage）
-    obj   : Q(x̄)，逐场景期望目标值
+    obj   : Q(x̄)，逐场景期望/条件目标值
     it    : 创建该割的训练轮次（0 = 初始化平凡割）
+    group : multi 的场景/theta 索引；single 恒为 0。仅内部绑定，不是调参参数。
     """
 
     alpha: float
@@ -43,12 +46,16 @@ class Cut:
     stage: int
     obj: float
     it: int
+    group: int = 0   # multi: 场景/theta 索引；single: 0
 
     def __post_init__(self) -> None:
         self.alpha = float(self.alpha)
         self.beta = np.asarray(self.beta, dtype=float).ravel()
         self.state = np.asarray(self.state, dtype=float).ravel()
         self.obj = float(self.obj)
+        self.group = int(self.group)
+        if self.group < 0:
+            raise ValueError(f"group 不得为负，实际 {self.group}")
         if self.beta.shape != self.state.shape:
             raise ValueError(f"beta/state 维度不一致: {self.beta.shape} vs {self.state.shape}")
 
@@ -66,20 +73,22 @@ class Cut:
     def to_dict(self) -> dict:
         return {"alpha": self.alpha, "beta": self.beta.tolist(),
                 "state": self.state.tolist(), "stage": self.stage,
-                "obj": self.obj, "it": self.it}
+                "obj": self.obj, "it": self.it, "group": self.group}
 
     @classmethod
     def from_dict(cls, d: dict) -> "Cut":
         return cls(alpha=d["alpha"], beta=d["beta"], state=d["state"],
-                   stage=d["stage"], obj=d["obj"], it=d["it"])
+                   stage=d["stage"], obj=d["obj"], it=d["it"],
+                   group=int(d.get("group", 0)))
 
 
-def trivial_cut(stage: int, state, dim: int) -> Cut:
+def trivial_cut(stage: int, state, dim: int, group: int = 0) -> Cut:
     """平凡割 alpha=0, beta=0。
 
     目标非负 ⇒ V_t >= 0 处处成立 ⇒ theta >= 0 永远有效，可作为割集的初始元素。
     """
-    return Cut(0.0, np.zeros(dim), np.asarray(state, dtype=float).ravel(), stage, 0.0, 0)
+    return Cut(0.0, np.zeros(dim), np.asarray(state, dtype=float).ravel(),
+               stage, 0.0, 0, group)
 
 
 def pack(cuts, dim: int) -> tuple[np.ndarray, np.ndarray]:

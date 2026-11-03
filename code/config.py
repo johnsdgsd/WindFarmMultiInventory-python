@@ -230,6 +230,7 @@ class SolverConfig:
     cut_selection: str
     cut_select_eps: float
     cut_select_keep_rounds: int
+    mode: str
     # 并行
     n_processes: int
     threads_per_process: int
@@ -280,6 +281,10 @@ class SolverConfig:
         if self.cut_select_keep_rounds < 0:
             raise ValueError(f"[training] cut_select_keep_rounds 不得为负，"
                              f"实际 {self.cut_select_keep_rounds}")
+        if self.mode not in ("single", "multi"):
+            raise ValueError(f"[training] mode 只能是 single/multi，实际 {self.mode!r}")
+        if self.mode == "multi" and self.n_backward_samples != 0:
+            raise ValueError("[training] mode=multi 时必须 n_backward_samples=0（全池枚举）")
         if self.max_train_seconds < 0:
             raise ValueError(f"[training] max_train_seconds 不得为负（0 = 不限），"
                              f"实际 {self.max_train_seconds}")
@@ -303,6 +308,7 @@ class SolverConfig:
             f"（{self.forward_paths_per_process} × {self.n_processes} 进程）"
             f"  后向场景 {self.n_backward_samples or '全枚举'}"
             f"  割筛选 {self.cut_selection}"
+            f"  模式 {self.mode}"
             f"  时限 {self.max_train_seconds or '不限'} s",
             f"并行   进程 {self.n_processes}  每进程 COPT 线程 {self.threads_per_process}",
             f"仿真   路径 {self.n_simulations}  块大小 {self.chunk_size}",
@@ -333,6 +339,7 @@ def load_solver_config(path, *, resolve: bool = True) -> SolverConfig:
         cut_selection=str(_req(tr, "cut_selection", "solver.toml/training")),
         cut_select_eps=float(_req(tr, "cut_select_eps", "solver.toml/training")),
         cut_select_keep_rounds=int(_req(tr, "cut_select_keep_rounds", "solver.toml/training")),
+        mode=str(_opt(tr, "mode", "single", "solver.toml/training")),
         n_processes=int(_req(pa, "n_processes", "solver.toml/parallel")),
         threads_per_process=int(_req(pa, "threads_per_process", "solver.toml/parallel")),
         n_simulations=int(_req(si, "n_simulations", "solver.toml/simulation")),

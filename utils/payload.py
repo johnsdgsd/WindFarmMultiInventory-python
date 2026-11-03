@@ -22,12 +22,16 @@ import numpy as np
 
 
 class StagePayload:
-    """一个阶段的割集 (alpha (n,), beta (n, dim))。"""
+    """一个阶段的割集 (alpha (n,), beta (n, dim), group (n,))。"""
 
-    def __init__(self, alpha, beta):
+    def __init__(self, alpha, beta, groups=None):
         a = np.ascontiguousarray(alpha, dtype=float)
         b = np.ascontiguousarray(beta, dtype=float)
-        self._arrays = [a, b]
+        g = (np.zeros(a.size, dtype=float) if groups is None
+             else np.ascontiguousarray(groups, dtype=float))
+        if g.size != a.size:
+            raise ValueError(f"group 数 {g.size} ≠ 割数 {a.size}")
+        self._arrays = [a, b, g]
         self._shm = None
         nbytes = int(a.nbytes + b.nbytes)
         if nbytes == 0:
@@ -70,7 +74,7 @@ class StagePayload:
 
 @contextlib.contextmanager
 def attached(ref):
-    """worker 侧：映射一块割集，用完即关。返回 (alpha, beta) 或 None。
+    """worker 侧：映射一块割集，用完即关。返回 (alpha,beta,groups) 或 None。
 
     None 表示"没有割集"——调用方必须把 None 与"空割集"区分开：
     空割集会让 theta 进目标却无约束，LP 无界。
@@ -79,8 +83,8 @@ def attached(ref):
         yield None
         return
     if ref.get("kind") == "pickle":
-        a, b = ref["arrays"]
-        yield (a, b)
+        a, b, g = ref["arrays"]
+        yield (a, b, g)
         return
     shm = shared_memory.SharedMemory(name=ref["name"])
     try:
@@ -89,15 +93,17 @@ def attached(ref):
             arr = np.ndarray(shape, dtype=float, buffer=shm.buf, offset=off)
             arrs.append(arr)
             off += arr.nbytes
-        yield (arrs[0], arrs[1])
+        yield (arrs[0], arrs[1], arrs[2])
     finally:
         with contextlib.suppress(Exception):
             shm.close()
 
 
 def put_cuts(cuts, dim: int) -> StagePayload:
-    """[Cut] -> StagePayload。"""
+    """[Cut] -> StagePayload（含 group 数组）。"""
     if not cuts:
-        return StagePayload(np.zeros(0), np.zeros((0, dim)))
+        return StagePayload(np.zeros(0), np.zeros((0, dim)),
+                            np.zeros(0, dtype=float))
     return StagePayload(np.array([c.alpha for c in cuts], dtype=float),
-                        np.vstack([c.beta for c in cuts]).astype(float))
+                        np.vstack([c.beta for c in cuts]).astype(float),
+                        np.array([c.group for c in cuts], dtype=float))

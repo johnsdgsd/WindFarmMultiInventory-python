@@ -78,6 +78,10 @@ class StageSubproblem:
         self.prob_data = prob
         self.layout = prob.layout
         self.cfg = cfg
+        self.mode = str(getattr(cfg, "mode", "single"))
+        self.n_theta = 1 if self.mode == "single" else len(prob.pool)
+        self.theta_weights = np.full(self.n_theta, 1.0 / self.n_theta)
+        self._thetas = []
         self.is_virtual = (self.t == 0)
         self._state_vec = None
         self._scene = None
@@ -120,8 +124,13 @@ class StageSubproblem:
         q_in = [xin[Ly.ix_q(r)] for r in range(N_R)]
         q_out = [xout[Ly.ix_q(r)] for r in range(N_R)]
 
-        # 未来成本变量：base 里就位，由 assemble 决定它进不进目标。
-        self._theta = m.addVar(lb=-INF, ub=INF, obj=0.0, name="theta")
+        # 未来成本变量：single 1 个；multi 每个场景 1 个。base 里就位，由 assemble 定目标权重。
+        self._thetas = [
+            m.addVar(lb=-INF, ub=INF, obj=0.0,
+                     name=("theta" if self.n_theta == 1 else f"theta_{k}"))
+            for k in range(self.n_theta)
+        ]
+        self._theta = self._thetas[0]
 
         if self.is_virtual:
             # 虚拟首阶段：(2) 容量约束出侧；q_out 是唯一自由决策；目标只有 theta
@@ -251,27 +260,49 @@ class StageSubproblem:
             self._cut_rows = []
 
         if cuts_next is None or len(cuts_next[0]) == 0:
-            # 末阶段或空割集：theta 钉在 0。空割集必须走这里，否则 LP 无界。
-            m.setInfo(COPT.Info.LB, [self._theta], 0.0)
-            m.setInfo(COPT.Info.UB, [self._theta], 0.0)
-            m.setInfo(COPT.Info.Obj, [self._theta], 0.0)
+            # 末阶段或空割集：所有 theta 钉在 0。空割集必须走这里，否则 LP 无界。
+            m.setInfo(COPT.Info.LB, self._thetas, 0.0)
+            m.setInfo(COPT.Info.UB, self._thetas, 0.0)
+            m.setInfo(COPT.Info.Obj, self._thetas, 0.0)
         else:
-            alpha, beta = cuts_next
+            if len(cuts_next) == 2:
+                if self.n_theta != 1:
+                    raise ValueError("multi 模式必须有 group 数组；收到旧式 (alpha,beta)")
+                alpha, beta = cuts_next
+                groups = np.zeros(len(alpha), dtype=int)
+            else:
+                alpha, beta, groups = cuts_next
+                g = np.asarray(groups, dtype=float)
+                if g.size != len(alpha):
+                    raise ValueError(f"group 数 {g.size} ≠ 割数 {len(alpha)}")
+                if np.any(np.abs(g - np.rint(g)) > 1e-9):
+                    raise ValueError("group 必须是整数")
+                groups = np.rint(g).astype(int)
+                if groups.size and (groups.min() < 0 or groups.max() >= self.n_theta):
+                    raise ValueError(f"group 越界：{groups.min()}..{groups.max()}，"
+                                     f"K={self.n_theta}")
+            seen = np.zeros(self.n_theta, dtype=bool)
             xout = self.x_out
             rows = []
             for i in range(len(alpha)):
+                g = int(groups[i])
+                seen[g] = True
                 b = beta[i]
                 nz = np.nonzero(np.abs(b) > CUT_EPS)[0]
                 expr = LinExpr()
                 expr.reserve(nz.size + 1)
-                expr.addTerm(self._theta, 1.0)
+                expr.addTerm(self._thetas[g], 1.0)
                 if nz.size:
                     expr.addTerms([xout[j] for j in nz], -b[nz])
                 rows.append(m.addConstr(expr >= float(alpha[i]), name=f"cut_{i}"))
+            if not seen.all():
+                missing = np.flatnonzero(~seen)
+                raise ValueError(f"multi 模式 group 无割，theta 会无界：{missing[:5]}")
             self._cut_rows = rows
-            m.setInfo(COPT.Info.LB, [self._theta], -INF)
-            m.setInfo(COPT.Info.UB, [self._theta], INF)
-            m.setInfo(COPT.Info.Obj, [self._theta], 1.0)
+            m.setInfo(COPT.Info.LB, self._thetas, -INF)
+            m.setInfo(COPT.Info.UB, self._thetas, INF)
+            m.setInfo(COPT.Info.Obj, self._thetas,
+                      [float(w) for w in self.theta_weights])
         self._cut_key = key
         return self
 
@@ -355,7 +386,8 @@ class StageSubproblem:
         return float(self._obj)
 
     def theta_value(self) -> float:
-        return float(ce.values(self.model, self._theta))
+        vals = np.asarray(ce.values(self.model, self._thetas), dtype=float)
+        return float(np.dot(self.theta_weights, vals))
 
     def stage_cost(self) -> float:
         """本期真实成本（不含 theta）。"""

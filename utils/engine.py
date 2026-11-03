@@ -5,8 +5,8 @@
       (a) 前向 —— 采样 N 条路径，每路径独立走完 T+1 期解 LP 得策略，
           收齐试探点 trial[t] 与前向总成本（上界估计）；
       (b) 后向 —— **按阶段串行，期内并行**：t 从 T 递减到 1，把该阶段的 N 个试探点
-          平均分给 worker，每 worker 对一个试探点枚举场景解 LP 取对偶、平均成一条割；
-          本阶段所有割算完再一起入库，然后才推进到 t−1；
+          平均分给 worker；single 对一个试探点枚举场景后平均成一条割，multi 保留每个
+          场景一条割并绑定到对应 theta；本阶段所有割算完再一起入库，然后才推进到 t−1；
       (c) 下界 —— 阶段 0 子问题（割口径与后向一致）。
 
 **为什么必须"期间串行"**：旧实现轮初打一份割快照、全部 (期 × 试探点) 任务一次铺满，
@@ -29,8 +29,8 @@ import numpy as np
 from .cut import Cut, trivial_cut
 from .io import TrainingLog, save_cuts
 from .payload import StagePayload, put_cuts
-from .worker import (backward_point_task, forward_path_task, init_worker,
-                     lower_bound_task)
+from .worker import (backward_multicut_task, backward_point_task,
+                     forward_path_task, init_worker, lower_bound_task)
 
 
 def _default_ctx():
@@ -66,14 +66,23 @@ class SDDPEngine:
         self.log = log if log is not None else (lambda *a, **k: None)
 
         self.n_scenes = len(prob.pool)
+        self.mode = str(getattr(cfg, "mode", "single"))
+        self.n_theta = 1 if self.mode == "single" else self.n_scenes
         _k = int(getattr(cfg, "n_backward_samples", 0))
         if 0 < _k < self.n_scenes:
             self.log(
                 f"[警告] 后向只抽 {_k}/{self.n_scenes} 个场景：割只对该子样本子问题成立，"
                 f"LB 可能高于全池 UB；要全池有效 LB 请把 n_backward_samples 设为 0")
+        if self.mode == "multi" and _k != 0:
+            raise ValueError("mode=multi 要求 n_backward_samples=0（全池枚举）")
         self.cuts: list[list[Cut]] = [[] for _ in range(self.T + 1)]
         for t in range(1, self.T + 1):
-            self.cuts[t].append(trivial_cut(t, self.initial_state, self.state_dim))
+            if self.mode == "single":
+                self.cuts[t].append(trivial_cut(t, self.initial_state, self.state_dim))
+            else:
+                for g in range(self.n_theta):
+                    self.cuts[t].append(trivial_cut(
+                        t, self.initial_state, self.state_dim, group=g))
 
         self.n_solves = 0
         self.n_cut_dropped = 0
@@ -86,9 +95,13 @@ class SDDPEngine:
         self.cut_selection = str(getattr(cfg, "cut_selection", "none"))
         self.cut_select_eps = float(getattr(cfg, "cut_select_eps", 1e-6))
         self.cut_select_keep_rounds = int(getattr(cfg, "cut_select_keep_rounds", 0))
-        self._pts: list[list] = [[] for _ in range(self.T + 1)]   # 历史试探点
+        self._pts: list[list] = [[] for _ in range(self.T + 1)]   # 历史试探点（single）
         self._mx: list[list] = [[] for _ in range(self.T + 1)]    # 该点处当前最大割值
         self._rc: list[list] = [[] for _ in range(self.T + 1)]    # 保留的最旧最大割
+        # multi：每个 (阶段, theta) 独立维护 LML1 历史；不跨 theta 比较。
+        self._pts_g = [[[] for _ in range(self.n_theta)] for _ in range(self.T + 1)]
+        self._mx_g = [[[] for _ in range(self.n_theta)] for _ in range(self.T + 1)]
+        self._rc_g = [[[] for _ in range(self.n_theta)] for _ in range(self.T + 1)]
         self._pool = None
         if self.n_processes > 1:
             self._pool = _default_ctx().Pool(
@@ -169,23 +182,43 @@ class SDDPEngine:
             points = trial[t]
             if not points:
                 continue
-            inds = self._sample_scenes(len(points))
             blk = put_cuts(self.cuts[t + 1] if t < self.T else [], self.state_dim)
             try:
-                tasks = [(self.round_id, t, i, np.asarray(x, dtype=float), inds[i],
-                          blk.ref) for i, x in enumerate(points)]
-                results = self._map(backward_point_task, tasks)
+                if self.mode == "multi":
+                    inds = list(range(self.n_scenes))
+                    tasks = [(self.round_id, t, i, np.asarray(x, dtype=float), inds,
+                              blk.ref) for i, x in enumerate(points)]
+                    results = self._map(backward_multicut_task, tasks)
+                else:
+                    inds = self._sample_scenes(len(points))
+                    tasks = [(self.round_id, t, i, np.asarray(x, dtype=float),
+                              inds[i], blk.ref) for i, x in enumerate(points)]
+                    results = self._map(backward_point_task, tasks)
             finally:
                 blk.close()
-            self.n_solves += sum(len(s) for s in inds)
             new_cuts = []
-            for (_, _, _, x, _, _), (beta, obj) in zip(tasks, results):
-                c = Cut(float(obj) - float(beta @ x), beta, x, t, float(obj), it)
-                self.cuts[t].append(c)
-                new_cuts.append(c)
-                n_added += 1
-            if self.cut_selection == "lml1":
-                self._lml1_update(t, points, new_cuts)
+            if self.mode == "multi":
+                self.n_solves += len(points) * self.n_scenes
+                for (_, _, _, x, _, _), (betas, objs) in zip(tasks, results):
+                    for k in range(self.n_scenes):
+                        beta = betas[k]
+                        obj = float(objs[k])
+                        c = Cut(float(obj) - float(beta @ x), beta, x, t,
+                                obj, it, group=k)
+                        self.cuts[t].append(c)
+                        new_cuts.append(c)
+                        n_added += 1
+                if self.cut_selection == "lml1":
+                    self._lml1_update_multi(t, points, new_cuts)
+            else:
+                self.n_solves += sum(len(s) for s in inds)
+                for (_, _, _, x, _, _), (beta, obj) in zip(tasks, results):
+                    c = Cut(float(obj) - float(beta @ x), beta, x, t, float(obj), it)
+                    self.cuts[t].append(c)
+                    new_cuts.append(c)
+                    n_added += 1
+                if self.cut_selection == "lml1":
+                    self._lml1_update(t, points, new_cuts)
         return n_added
 
     # ------------------------------------------------------------ LML1 割筛选
@@ -201,6 +234,9 @@ class SDDPEngine:
         self._pts = [[] for _ in range(self.T + 1)]
         self._mx = [[] for _ in range(self.T + 1)]
         self._rc = [[] for _ in range(self.T + 1)]
+        self._pts_g = [[[] for _ in range(self.n_theta)] for _ in range(self.T + 1)]
+        self._mx_g = [[[] for _ in range(self.n_theta)] for _ in range(self.T + 1)]
+        self._rc_g = [[[] for _ in range(self.n_theta)] for _ in range(self.T + 1)]
         n = 0
         for t in range(1, self.T + 1):
             for c in self.cuts[t]:
@@ -210,9 +246,16 @@ class SDDPEngine:
                 if x.size != self.state_dim:
                     raise ValueError(
                         f"stage {t}: 割的 state 维度 {x.size} ≠ {self.state_dim}")
-                self._pts[t].append(x)
-                self._mx[t].append(float(c.alpha + c.beta @ x))
-                self._rc[t].append(c)
+                if self.mode == "multi":
+                    if not 0 <= c.group < self.n_theta:
+                        raise ValueError(f"stage {t}: cut group {c.group} 越界")
+                    self._pts_g[t][c.group].append(x)
+                    self._mx_g[t][c.group].append(float(c.alpha + c.beta @ x))
+                    self._rc_g[t][c.group].append(c)
+                else:
+                    self._pts[t].append(x)
+                    self._mx[t].append(float(c.alpha + c.beta @ x))
+                    self._rc[t].append(c)
                 n += 1
         return n
 
@@ -253,6 +296,48 @@ class SDDPEngine:
             if len(pts) > keep_n:
                 del pts[:-keep_n], mx[:-keep_n], rc[:-keep_n]
         alive = {id(c) for c in rc}
+        before = len(self.cuts[t])
+        self.cuts[t] = [c for c in self.cuts[t]
+                        if c.it == 0 or id(c) in alive]
+        self.n_cut_dropped += before - len(self.cuts[t])
+
+    def _lml1_update_multi(self, t: int, new_points, new_cuts) -> None:
+        """按 (t, theta) 独立的 LML1：不同场景的割绝不互相比较/删除。"""
+        by_g = {g: [] for g in range(self.n_theta)}
+        for c in new_cuts:
+            by_g[c.group].append(c)
+        for g, cuts_g in by_g.items():
+            if len(cuts_g) != len(new_points):
+                raise RuntimeError(f"stage {t} group {g}: 新割数 {len(cuts_g)} "
+                                   f"≠ 试探点数 {len(new_points)}")
+            pts = self._pts_g[t][g]
+            mx = self._mx_g[t][g]
+            rc = self._rc_g[t][g]
+            for x, c in zip(new_points, cuts_g):
+                px = np.asarray(x, dtype=float).ravel()
+                pts.append(px)
+                mx.append(float(c.alpha + c.beta @ px))
+                rc.append(c)
+            if not pts:
+                continue
+            M = np.asarray(mx, dtype=float).copy()
+            X = np.vstack(pts)
+            tol = self.cut_select_eps * np.maximum(1.0, np.abs(M))
+            for c in cuts_g:
+                vals = X @ c.beta + c.alpha
+                better = vals > M + tol
+                if better.any():
+                    idx = np.nonzero(better)[0]
+                    M[idx] = vals[idx]
+                    tol[idx] = self.cut_select_eps * np.maximum(1.0, np.abs(vals[idx]))
+                    for i in idx:
+                        rc[i] = c
+            mx[:] = M.tolist()
+            if self.cut_select_keep_rounds > 0:
+                keep_n = self.cut_select_keep_rounds * int(self.cfg.n_forward_paths)
+                if len(pts) > keep_n:
+                    del pts[:-keep_n], mx[:-keep_n], rc[:-keep_n]
+        alive = {id(c) for g in range(self.n_theta) for c in self._rc_g[t][g]}
         before = len(self.cuts[t])
         self.cuts[t] = [c for c in self.cuts[t]
                         if c.it == 0 or id(c) in alive]
@@ -313,7 +398,8 @@ class SDDPEngine:
                        "sim": sim, "time": elapsed,
                        "solves": self.n_solves, "mip_fallback": n_fb,
                        "n_cuts": sum(len(c) for c in self.cuts[1:]),
-                       "n_dropped": self.n_cut_dropped}
+                       "n_dropped": self.n_cut_dropped,
+                       "mode": self.mode, "n_theta": self.n_theta}
                 history.append(rec)
                 if self.on_iter is not None:
                     self.on_iter(rec)
@@ -352,6 +438,8 @@ class SDDPEngine:
                 "lambda0": getattr(self.prob, "lambda0", None),
                 "dirichlet_s": getattr(self.prob, "dirichlet_s", None),
                 "n_scenes": self.n_scenes,
+                "mode": self.mode,
+                "n_theta": self.n_theta,
                 "n_iterations": self.last_iter,
                 "n_cuts": sum(len(c) for c in self.cuts[1:]),
                 "n_solves": self.n_solves,

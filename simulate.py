@@ -133,7 +133,14 @@ def main(dir_arg: str, n_paths: int, chunk_size: int | None):
     dev = 0.0
     t0 = time.time()
     try:
-        cuts, meta_cuts = load_cuts(d, prob.T, prob.state_dim)
+        cuts, meta_cuts = load_cuts(d, prob.T, prob.state_dim,
+                                    expected_mode=scfg.mode)
+        if str(meta_cuts.get("mode", "single")) != scfg.mode or \
+                int(meta_cuts.get("n_theta", 1)) != eng.n_theta:
+            raise SystemExit(
+                f"割的 mode/K 与配置不一致："
+                f"{meta_cuts.get('mode', 'single')}/{meta_cuts.get('n_theta', 1)} "
+                f"vs {scfg.mode}/{eng.n_theta}")
         eng.cuts = cuts
         lb = eng.lower_bound()
         done, blk = 0, 0
@@ -172,6 +179,7 @@ def main(dir_arg: str, n_paths: int, chunk_size: int | None):
 
     np.savez_compressed(npz, **dump.a)
     meta = {"dir": d.name, "model": "markov_grade", "schema": 2,
+            "mode": scfg.mode, "n_theta": eng.n_theta,
             "n_paths": n_paths, "chunk_size": chunk, "T": T,
             "G": prob.G, "N_R": prob.N_R, "L": prob.L, "state_dim": Ly.dim,
             "lambda0": prob.lambda0, "dirichlet_s": prob.dirichlet_s,

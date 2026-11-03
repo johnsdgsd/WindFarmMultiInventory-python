@@ -25,7 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .cut import FORMAT_VERSION, Cut
+from .cut import FORMAT_VERSION, LEGACY_SINGLE_VERSION, Cut
 
 LOG_HEADER = (" iteration    simulation      bound        time (s)"
               "     solves  pid")
@@ -143,15 +143,20 @@ def save_cuts(d, cuts_by_stage, meta: dict, name: str = "cuts.json") -> Path:
     return path
 
 
-def load_cuts(d, t_max: int, dim: int, name: str = "cuts.json") -> tuple[list, dict]:
+def load_cuts(d, t_max: int, dim: int, name: str = "cuts.json",
+              expected_mode: str = "single") -> tuple[list, dict]:
     """读回割，返回 (cuts_by_stage, meta)。
 
-    版本不符直接拒收：维度校验只能发现 T/G/N_R 这类变化，**发现不了模型结构改动**
-    （约束写法、参数化方式），而那种改动同样让旧割失效（铁律 4）。
+    v6 支持 group（multi）；v5 只在 expected_mode="single" 时只读兼容（group=0）。
+    multi 绝不接受 v5，避免旧单割割冒充多 theta。
     """
     payload = load_json(d, name)
     ver = int(payload.get("version", 0))
-    if ver != FORMAT_VERSION:
+    if ver == LEGACY_SINGLE_VERSION:
+        if expected_mode != "single":
+            raise ValueError(
+                f"{Path(d) / name} 是 v5 单割文件，不能用于 mode={expected_mode}")
+    elif ver != FORMAT_VERSION:
         raise ValueError(
             f"{Path(d) / name} 的割格式版本 v{ver} ≠ 当前 v{FORMAT_VERSION}"
             f"（模型结构已改，旧割不兼容 —— 铁律 4：必须全新训练，不要 resume）")
