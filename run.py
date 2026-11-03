@@ -106,12 +106,7 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
         if resume_dir is not None:
             cuts, meta = load_cuts(d, prob.T, prob.state_dim,
                                    expected_mode=eng.mode)
-            m_mode = str(meta.get("mode", "single"))
-            m_k = int(meta.get("n_theta", 1))
-            if m_mode != eng.mode or m_k != eng.n_theta:
-                raise SystemExit(
-                    f"割的 mode/K={m_mode}/{m_k} 与当前 {eng.mode}/{eng.n_theta} "
-                    f"不一致，不能续训")
+            eng.check_cut_meta(meta)
             eng.cuts = cuts
             eng.lb_best = float(meta.get("lb_best", 0.0))
             if eng.cut_selection == "lml1":
@@ -161,7 +156,8 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
             f"间隙 gap    : {gap:.4f} %",
             f"总成本 std  : {st.std:.6f}   最小 {st.lo:.4f}   最大 {st.hi:.4f}",
             f"割数        : {sum(len(c) for c in eng.cuts)}",
-            f"模式        : {eng.mode}  (K={eng.n_theta})",
+            f"模式        : {eng.mode}  (K={eng.n_theta}"
+            + (f"，固定分区 {eng.group_mode}" if eng.grouped else "") + ")",
             f"累计求解    : {eng.n_solves}",
             f"用时        : {time.time() - t0:.1f} s",
             "",

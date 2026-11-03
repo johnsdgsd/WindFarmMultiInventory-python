@@ -219,6 +219,32 @@ def load_problem_config(path) -> ProblemConfig:
 
 # ------------------------------------------------------------------ 求解配置
 @dataclass
+class MulticutConfig:
+    """固定分区簇多割的分辨率。
+
+    n_clusters=0 表示旧的全场景多割（K=n_scenes）；>0 表示固定 L 簇。
+    group_mode 只对固定簇有意义；全场景多割必须用 scene。
+    """
+
+    n_clusters: int = 0
+    group_mode: str = "scene"
+
+    def __post_init__(self) -> None:
+        if self.n_clusters < 0:
+            raise ValueError(f"[multicut] n_clusters 不得为负，实际 {self.n_clusters}")
+        if self.group_mode not in ("scene", "failure_quantile", "failure_stride"):
+            raise ValueError(f"[multicut] group_mode 非法：{self.group_mode!r}")
+        if self.n_clusters == 0 and self.group_mode != "scene":
+            raise ValueError("[multicut] n_clusters=0 时必须 group_mode='scene'")
+        if self.n_clusters > 0 and self.group_mode == "scene":
+            raise ValueError("[multicut] n_clusters>0 时 group_mode 不能是 'scene'")
+
+    def describe(self) -> str:
+        return (f"L={self.n_clusters or 'n_scenes'} "
+                f"group={self.group_mode}")
+
+
+@dataclass
 class SolverConfig:
     # 训练
     iterations: int
@@ -231,6 +257,7 @@ class SolverConfig:
     cut_select_eps: float
     cut_select_keep_rounds: int
     mode: str
+    multicut: MulticutConfig
     # 并行
     n_processes: int
     threads_per_process: int
@@ -283,6 +310,9 @@ class SolverConfig:
                              f"实际 {self.cut_select_keep_rounds}")
         if self.mode not in ("single", "multi"):
             raise ValueError(f"[training] mode 只能是 single/multi，实际 {self.mode!r}")
+        if self.mode == "single" and (self.multicut.n_clusters != 0 or
+                                      self.multicut.group_mode != "scene"):
+            raise ValueError("[training] mode=single 时 [multicut] 必须为 0/scene")
         if self.mode == "multi" and self.n_backward_samples != 0:
             raise ValueError("[training] mode=multi 时必须 n_backward_samples=0（全池枚举）")
         if self.max_train_seconds < 0:
@@ -309,6 +339,7 @@ class SolverConfig:
             f"  后向场景 {self.n_backward_samples or '全枚举'}"
             f"  割筛选 {self.cut_selection}"
             f"  模式 {self.mode}"
+            f"  多割 {self.multicut.describe()}"
             f"  时限 {self.max_train_seconds or '不限'} s",
             f"并行   进程 {self.n_processes}  每进程 COPT 线程 {self.threads_per_process}",
             f"仿真   路径 {self.n_simulations}  块大小 {self.chunk_size}",
@@ -327,6 +358,16 @@ def load_solver_config(path, *, resolve: bool = True) -> SolverConfig:
     si = _section(raw, "simulation", path.name)
     nu = _section(raw, "numerics", path.name)
     ou = _section(raw, "output", path.name)
+    mc_raw = raw.get("multicut")
+    if mc_raw is None:
+        multicut = MulticutConfig()          # 旧结果目录兼容
+    else:
+        if not isinstance(mc_raw, dict):
+            raise TypeError(f"配置 {path.name} 的 [multicut] 必须是表")
+        multicut = MulticutConfig(
+            n_clusters=int(_req(mc_raw, "n_clusters", "solver.toml/multicut")),
+            group_mode=str(_req(mc_raw, "group_mode", "solver.toml/multicut")),
+        )
     cfg = SolverConfig(
         iterations=int(_req(tr, "iterations", "solver.toml/training")),
         forward_paths_per_process=int(
@@ -340,6 +381,7 @@ def load_solver_config(path, *, resolve: bool = True) -> SolverConfig:
         cut_select_eps=float(_req(tr, "cut_select_eps", "solver.toml/training")),
         cut_select_keep_rounds=int(_req(tr, "cut_select_keep_rounds", "solver.toml/training")),
         mode=str(_opt(tr, "mode", "single", "solver.toml/training")),
+        multicut=multicut,
         n_processes=int(_req(pa, "n_processes", "solver.toml/parallel")),
         threads_per_process=int(_req(pa, "threads_per_process", "solver.toml/parallel")),
         n_simulations=int(_req(si, "n_simulations", "solver.toml/simulation")),

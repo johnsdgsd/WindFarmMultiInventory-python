@@ -170,6 +170,29 @@ def backward_multicut_task(task):
     return grads, objs
 
 
+def backward_cluster_multicut_task(task):
+    """固定分区多割：每簇用均值 Θ 解 1 个 LP，返回 L 条未加权割。"""
+    from .partition import aggregate_theta
+
+    round_id, t, trial_idx, x, clusters, ref = task
+    prob, dim = _W["prob"], _W["dim"]
+    betas = np.empty((len(clusters), dim))
+    objs = np.empty(len(clusters))
+    with pl.attached(ref) as cuts_next:
+        sub = _shared_sub(t, cuts_next, (round_id, t, "bwd_cmulti"))
+        sub.set_state(x)
+        for k, inds in enumerate(clusters):
+            th = aggregate_theta(prob.pool, inds)
+            sub.set_scene((None, th))
+            try:
+                sub.solve_lp()
+            except Exception as exc:
+                raise _fail("backward_cluster_multicut", t, int(inds[0]), sub, exc)
+            betas[k] = sub.gradient("dj")
+            objs[k] = sub.obj
+    return betas, objs
+
+
 # ---------------------------------------------------------------- 下界任务
 def lower_bound_task(task):
     """阶段 0 子问题解 LP。割只增不减 ⇒ 下界单调不减，且不依赖随机数。"""

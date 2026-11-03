@@ -79,8 +79,18 @@ class StageSubproblem:
         self.layout = prob.layout
         self.cfg = cfg
         self.mode = str(getattr(cfg, "mode", "single"))
-        self.n_theta = 1 if self.mode == "single" else len(prob.pool)
-        self.theta_weights = np.full(self.n_theta, 1.0 / self.n_theta)
+        if self.mode == "single":
+            self.groups = [list(range(len(prob.pool)))]
+            self.n_theta = 1
+            self.theta_weights = np.array([1.0])
+        else:
+            mc = getattr(cfg, "multicut", None)
+            L = 0 if mc is None else int(mc.n_clusters)
+            gm = "scene" if mc is None else str(mc.group_mode)
+            from utils.partition import cluster_weights, fixed_partition
+            self.groups = fixed_partition(prob.pool, len(prob.pool), L, gm)
+            self.n_theta = len(self.groups)
+            self.theta_weights = cluster_weights(self.groups, len(prob.pool))
         self._thetas = []
         self.is_virtual = (self.t == 0)
         self._state_vec = None

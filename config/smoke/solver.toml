@@ -12,6 +12,10 @@ cut_select_eps = 1e-6
 cut_select_keep_rounds = 0
 seed = 2026
 
+[multicut]
+n_clusters = 0
+group_mode = "scene"
+
 [parallel]
 n_processes = 2                   # 2 进程：冒烟也走一趟多进程链路
 threads_per_process = 1

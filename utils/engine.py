@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import multiprocessing as mp
 import time
 from pathlib import Path
@@ -28,9 +29,11 @@ import numpy as np
 
 from .cut import Cut, trivial_cut
 from .io import TrainingLog, save_cuts
+from .partition import cluster_weights, fixed_partition
 from .payload import StagePayload, put_cuts
-from .worker import (backward_multicut_task, backward_point_task,
-                     forward_path_task, init_worker, lower_bound_task)
+from .worker import (backward_cluster_multicut_task, backward_multicut_task,
+                     backward_point_task, forward_path_task, init_worker,
+                     lower_bound_task)
 
 
 def _default_ctx():
@@ -67,7 +70,25 @@ class SDDPEngine:
 
         self.n_scenes = len(prob.pool)
         self.mode = str(getattr(cfg, "mode", "single"))
-        self.n_theta = 1 if self.mode == "single" else self.n_scenes
+        mc = getattr(cfg, "multicut", None)
+        self.group_mode = "scene" if mc is None else str(mc.group_mode)
+        self.n_clusters_cfg = 0 if mc is None else int(mc.n_clusters)
+        self.clusters = None
+        if self.mode == "single":
+            self.n_theta = 1
+            self.cluster_weights = np.array([1.0])
+            self.grouped = False
+        elif self.n_clusters_cfg == 0:
+            self.clusters = [[i] for i in range(self.n_scenes)]
+            self.n_theta = self.n_scenes
+            self.cluster_weights = cluster_weights(self.clusters, self.n_scenes)
+            self.grouped = False
+        else:
+            self.clusters = fixed_partition(prob.pool, self.n_scenes,
+                                            self.n_clusters_cfg, self.group_mode)
+            self.n_theta = len(self.clusters)
+            self.cluster_weights = cluster_weights(self.clusters, self.n_scenes)
+            self.grouped = True
         _k = int(getattr(cfg, "n_backward_samples", 0))
         if 0 < _k < self.n_scenes:
             self.log(
@@ -184,7 +205,11 @@ class SDDPEngine:
                 continue
             blk = put_cuts(self.cuts[t + 1] if t < self.T else [], self.state_dim)
             try:
-                if self.mode == "multi":
+                if self.grouped:
+                    tasks = [(self.round_id, t, i, np.asarray(x, dtype=float),
+                              self.clusters, blk.ref) for i, x in enumerate(points)]
+                    results = self._map(backward_cluster_multicut_task, tasks)
+                elif self.mode == "multi":
                     inds = list(range(self.n_scenes))
                     tasks = [(self.round_id, t, i, np.asarray(x, dtype=float), inds,
                               blk.ref) for i, x in enumerate(points)]
@@ -197,7 +222,20 @@ class SDDPEngine:
             finally:
                 blk.close()
             new_cuts = []
-            if self.mode == "multi":
+            if self.grouped:
+                self.n_solves += len(points) * self.n_theta
+                for (_, _, _, x, _, _), (betas, objs) in zip(tasks, results):
+                    for k in range(self.n_theta):
+                        beta = betas[k]
+                        obj = float(objs[k])
+                        c = Cut(float(obj) - float(beta @ x), beta, x, t,
+                                obj, it, group=k)
+                        self.cuts[t].append(c)
+                        new_cuts.append(c)
+                        n_added += 1
+                if self.cut_selection == "lml1":
+                    self._lml1_update_multi(t, points, new_cuts)
+            elif self.mode == "multi":
                 self.n_solves += len(points) * self.n_scenes
                 for (_, _, _, x, _, _), (betas, objs) in zip(tasks, results):
                     for k in range(self.n_scenes):
@@ -440,10 +478,51 @@ class SDDPEngine:
                 "n_scenes": self.n_scenes,
                 "mode": self.mode,
                 "n_theta": self.n_theta,
+                "multicut": self.multicut_meta(),
                 "n_iterations": self.last_iter,
                 "n_cuts": sum(len(c) for c in self.cuts[1:]),
                 "n_solves": self.n_solves,
                 "lb_best": self.lb_best}
+
+    def check_cut_meta(self, meta: dict) -> None:
+        """割文件的身份校验。n_theta 相同不代表分组相同：L=n 的 failure 分位簇与
+        全场景多割都是 n 个 theta，必须再比对 cluster_sizes/cluster_hash。
+        旧结果没有 multicut 块时按 ``n_clusters=0, group_mode="scene"`` 处理。"""
+        m_mode = str(meta.get("mode", "single"))
+        m_k = int(meta.get("n_theta", 1))
+        if m_mode != self.mode or m_k != self.n_theta:
+            raise SystemExit(
+                f"割的 mode/K={m_mode}/{m_k} 与当前 {self.mode}/{self.n_theta} "
+                f"不一致，不能使用")
+        mc = meta.get("multicut") or {}
+        m_ncl = int(mc.get("n_clusters", 0))
+        m_gm = str(mc.get("group_mode", "scene"))
+        cur = self.multicut_meta()
+        if m_ncl != cur["n_clusters"] or m_gm != cur["group_mode"]:
+            raise SystemExit(
+                f"割的固定分区 n_clusters/group_mode={m_ncl}/{m_gm} 与当前 "
+                f"{cur['n_clusters']}/{cur['group_mode']} 不一致，不能使用")
+        if self.grouped:
+            m_sizes = list(mc.get("cluster_sizes", []))
+            m_hash = str(mc.get("cluster_hash", ""))
+            if m_sizes != cur["cluster_sizes"] or m_hash != cur["cluster_hash"]:
+                raise SystemExit(
+                    "割的簇成员与当前固定分区不一致（cluster_sizes/hash 不符），"
+                    "不能使用")
+
+    def multicut_meta(self) -> dict:
+        """固定分区的身份：cluster_sizes 相同不代表成员相同，必须带 hash。"""
+        if self.mode == "single":
+            return {"n_clusters": 0, "group_mode": "scene",
+                    "cluster_sizes": [], "cluster_hash": ""}
+        groups = self.clusters if self.clusters is not None else \
+            [[i] for i in range(self.n_scenes)]
+        sizes = [len(g) for g in groups]
+        payload = ";".join(",".join(str(int(s)) for s in g) for g in groups)
+        h = hashlib.sha1(payload.encode("ascii")).hexdigest()
+        return {"n_clusters": self.n_theta if self.grouped else 0,
+                "group_mode": self.group_mode if self.grouped else "scene",
+                "cluster_sizes": sizes, "cluster_hash": h}
 
     def open_log(self, name: str = "sddp_training_log.csv") -> TrainingLog:
         if self.results_dir is None:

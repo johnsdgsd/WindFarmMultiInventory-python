@@ -25,6 +25,12 @@ cut_select_eps = 1e-6           # ε0：判断两个割值是否并列
 cut_select_keep_rounds = 0      # 试探点保留的轮数；0 = 全部保留（文档原版）
 seed = 2026
 
+
+# 固定分区簇多割：n_clusters=L，每簇一个 theta/一条聚合代表割
+[multicut]
+n_clusters = 0
+group_mode = "scene"
+
 [parallel]
 n_processes = 0           # 0 = 自动（物理核数 // 2）；1 = 串行（调试用，traceback 完整）
 threads_per_process = 1   # COPT 的 Threads。多进程下必须为 1：
