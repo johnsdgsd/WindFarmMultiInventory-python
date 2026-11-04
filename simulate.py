@@ -134,9 +134,11 @@ def main(dir_arg: str, n_paths: int, chunk_size: int | None):
     t0 = time.time()
     try:
         cuts, meta_cuts = load_cuts(d, prob.T, prob.state_dim,
-                                    expected_mode=scfg.mode)
+                                    expected_mode=scfg.mode,
+                                    allow_legacy_v6=True)
         eng.check_cut_meta(meta_cuts)
         eng.cuts = cuts
+        eng.restore_refine_state(meta_cuts)
         lb = eng.lower_bound()
         done, blk = 0, 0
         while done < n_paths:
@@ -173,8 +175,12 @@ def main(dir_arg: str, n_paths: int, chunk_size: int | None):
     stage_mean = dump.a["cost"].mean(axis=0)
 
     np.savez_compressed(npz, **dump.a)
-    meta = {"dir": d.name, "model": "markov_grade", "schema": 2,
+    meta = {"dir": d.name, "model": "markov_grade", "schema": 3,
             "mode": scfg.mode, "n_theta": eng.n_theta,
+            "theta_cap": eng.theta_cap,
+            "n_theta_by_stage": [int(eng.K[t]) for t in range(1, eng.T + 1)],
+            "layouts": eng.layouts_meta(),
+            "refine": eng.refine_meta(),
             "multicut": eng.multicut_meta(),
             "n_paths": n_paths, "chunk_size": chunk, "T": T,
             "G": prob.G, "N_R": prob.N_R, "L": prob.L, "state_dim": Ly.dim,

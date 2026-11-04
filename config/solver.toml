@@ -32,6 +32,11 @@ seed = 2026
 n_clusters = 0
 group_mode = "scene"
 
+# 割载荷传输方式：pickle=与历史固定 A 一致；shm=修复后的共享内存（更快，但
+# 会改变墙钟口径，实验 A/B 不要混用）。
+[io]
+payload_mode = "pickle"
+
 [parallel]
 n_processes = 0           # 0 = 自动（物理核数 // 2）；1 = 串行（调试用，traceback 完整）
 threads_per_process = 1   # COPT 的 Threads。多进程下必须为 1：

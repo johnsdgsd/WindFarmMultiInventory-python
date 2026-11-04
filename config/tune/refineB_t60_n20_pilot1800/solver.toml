@@ -1,0 +1,65 @@
+# 阶段 B：固定分区多割 + LB 停滞触发细化（refineB_t60_n20_pilot1800）
+[training]
+mode = "multi"
+iterations = 100000
+forward_paths_per_process = 1
+n_backward_samples = 0
+checkpoint_interval = 600.0
+max_train_seconds = 1800
+cut_selection = "lml1"
+cut_select_eps = 1e-6
+cut_select_keep_rounds = 0
+seed = 2026
+
+[multicut]
+n_clusters = 8
+group_mode = "failure_quantile"
+
+[io]
+payload_mode = "pickle"
+
+[refine]
+enabled = true
+max_refines = 8
+max_clusters_per_stage = 32
+theta_cap = 32
+max_attempts = 16
+max_children_per_event = 8
+min_child_size = 2
+candidate_stage_stride = 1
+min_remaining_seconds = 120
+min_event_gain = 1.0
+max_ineffective_events = 2
+warmup_rounds = 20
+stall_on = "lb_best"
+stall_window = 20
+stall_rtol = 1e-3
+stall_abs = 1.0
+cooldown_rounds = 10
+recovery_frac = 0.995
+recovery_timeout = 30
+min_refine_stage = 1
+signature = "pi"
+eps_sig = 0.0
+eps_sig_rel = 0.5
+eps_obj = 20.0
+
+[parallel]
+n_processes = 0
+threads_per_process = 1
+
+[simulation]
+n_simulations = 200
+chunk_size = 1000
+
+[numerics]
+feas_tol = 1e-6
+dual_tol = 1e-6
+int_tol = 1e-6
+presolve = -1
+mip_rel_gap = 0.001
+mip_time_limit = 20.0
+
+[output]
+tag = "refineB_t60_n20_pilot1800"
+results_root = "results"

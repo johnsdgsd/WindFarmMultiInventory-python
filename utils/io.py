@@ -25,7 +25,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .cut import FORMAT_VERSION, LEGACY_SINGLE_VERSION, Cut
+from .cut import (FORMAT_VERSION, LEGACY_MULTI_VERSION, LEGACY_SINGLE_VERSION,
+                  Cut)
 
 LOG_HEADER = (" iteration    simulation      bound        time (s)"
               "     solves  pid")
@@ -144,11 +145,13 @@ def save_cuts(d, cuts_by_stage, meta: dict, name: str = "cuts.json") -> Path:
 
 
 def load_cuts(d, t_max: int, dim: int, name: str = "cuts.json",
-              expected_mode: str = "single") -> tuple[list, dict]:
+              expected_mode: str = "single", *,
+              allow_legacy_v6: bool = False) -> tuple[list, dict]:
     """读回割，返回 (cuts_by_stage, meta)。
 
-    v6 支持 group（multi）；v5 只在 expected_mode="single" 时只读兼容（group=0）。
-    multi 绝不接受 v5，避免旧单割割冒充多 theta。
+    v7 = per-stage layouts；v6 = 全局固定布局，只读兼容（simulate 允许、resume
+    拒绝）；v5 只在 mode=single 时只读兼容。multi 绝不接受 v5。
+    meta 里注入 `_format_version`，供 engine/check_cut_meta 区分布局语义。
     """
     payload = load_json(d, name)
     ver = int(payload.get("version", 0))
@@ -156,6 +159,15 @@ def load_cuts(d, t_max: int, dim: int, name: str = "cuts.json",
         if expected_mode != "single":
             raise ValueError(
                 f"{Path(d) / name} 是 v5 单割文件，不能用于 mode={expected_mode}")
+    elif ver == LEGACY_MULTI_VERSION:
+        if not allow_legacy_v6:
+            raise ValueError(
+                f"{Path(d) / name} 是 v6 全局布局文件；只允许 simulate 只读，"
+                f"不能 resume（新训练会写 v7）")
+        m_mode = str(payload.get("meta", {}).get("mode", "multi"))
+        if m_mode != expected_mode:
+            raise ValueError(
+                f"{Path(d) / name} 的 v6 mode={m_mode} 与期望 {expected_mode} 不一致")
     elif ver != FORMAT_VERSION:
         raise ValueError(
             f"{Path(d) / name} 的割格式版本 v{ver} ≠ 当前 v{FORMAT_VERSION}"
@@ -170,7 +182,11 @@ def load_cuts(d, t_max: int, dim: int, name: str = "cuts.json",
         for c in cuts[t]:
             if c.dim != dim:
                 raise ValueError(f"割文件状态维度 {c.dim} ≠ 当前 {dim}（模型已改，不可 resume）")
-    return cuts, payload.get("meta", {})
+            if c.stage != t:
+                raise ValueError(f"割文件 stage 字段 {c.stage} 与期号 {t} 不一致")
+    meta = dict(payload.get("meta", {}))
+    meta["_format_version"] = ver
+    return cuts, meta
 
 
 def count_cuts(cuts_by_stage) -> int:

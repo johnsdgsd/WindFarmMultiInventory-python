@@ -108,6 +108,47 @@ def initial_partition(pool, n_scenes: int, k: int) -> list[list[int]]:
     return [order[i::k].tolist() for i in range(k)]
 
 
+def resolve_theta_cap(mode: str, n_clusters: int, n_scenes: int,
+                      refine_max_clusters: int = 0,
+                      configured: int = 0) -> int:
+    """max-K 共享模型建多少个 theta。
+
+    refine 关闭时 cap 必须等于 active K（fixed A=L、full multi=n、single=1），
+    保证与旧模型逐位一致；refine 开启时 cap 至少覆盖单阶段 K 上限。
+    """
+    if int(configured) > 0:
+        return int(configured)
+    base = 1 if mode == "single" else (int(n_scenes) if n_clusters == 0
+                                       else int(n_clusters))
+    return max(int(base), int(refine_max_clusters or 0))
+
+
+def split_cluster(parts, idx: int, children, n_scenes: int,
+                  stage: int | None = None) -> list[list[int]]:
+    """把一个簇替换成若干子簇；其他簇成员和顺序不变。"""
+    kids = [list(map(int, c)) for c in children]
+    if not kids or any(not c for c in kids):
+        raise ValueError("子簇不能为空")
+    out = [list(c) for c in parts]
+    out[idx:idx + 1] = kids
+    validate_partition(out, n_scenes, stage)
+    return out
+
+
+def cluster_dispersion(sigs, indices) -> float:
+    """簇内签名的两两 Euclidean 距离中位数（空/单点返回 0）。"""
+    idx = [int(i) for i in indices]
+    if len(idx) < 2:
+        return 0.0
+    return median_pairwise_distance(np.asarray(sigs, dtype=float)[idx])
+
+
+def normalized_cluster_score(sigs, indices, eps: float) -> float:
+    """跨阶段可比的离散度分数：簇内离散度 / 阈值。eps=0 时用 1 作分母。"""
+    denom = float(eps) if eps > 0 else 1.0
+    return cluster_dispersion(sigs, indices) / denom
+
+
 def fixed_partition(pool, n_scenes: int, n_clusters: int,
                     mode: str = "failure_quantile") -> list[list[int]]:
     """固定分区（全阶段同一套簇）。

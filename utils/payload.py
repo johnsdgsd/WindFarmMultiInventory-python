@@ -16,15 +16,25 @@ shm 不可用时回退为任务内直接 pickle。
 from __future__ import annotations
 
 import contextlib
+from collections import namedtuple
 from multiprocessing import shared_memory
 
 import numpy as np
 
+# 每个阶段子问题的 theta 规格：只用前 active_k 个 theta；weights 是未来阶段
+# 分区 P_{t+1} 的权重；layout_gen/cut_gen 变更时强制重新拼装割行。
+ThetaSpec = namedtuple("ThetaSpec", "active_k weights layout_gen cut_gen")
+
 
 class StagePayload:
-    """一个阶段的割集 (alpha (n,), beta (n, dim), group (n,))。"""
+    """一个阶段的割集 (alpha (n,), beta (n, dim), group (n,))。
 
-    def __init__(self, alpha, beta, groups=None):
+    use_shm=False 时直接 pickle 传数组。B 实验默认 pickle，与固定 A 的历史口径
+    一致；shm 只作独立性能对照。修复过的 nbytes 必须包含 group 数组，否则三次
+    写入会越界、被 except 吞掉后静默退回 pickle。
+    """
+
+    def __init__(self, alpha, beta, groups=None, use_shm: bool = False):
         a = np.ascontiguousarray(alpha, dtype=float)
         b = np.ascontiguousarray(beta, dtype=float)
         g = (np.zeros(a.size, dtype=float) if groups is None
@@ -33,9 +43,11 @@ class StagePayload:
             raise ValueError(f"group 数 {g.size} ≠ 割数 {a.size}")
         self._arrays = [a, b, g]
         self._shm = None
-        nbytes = int(a.nbytes + b.nbytes)
+        nbytes = int(sum(arr.nbytes for arr in self._arrays))
         if nbytes == 0:
             self.ref = {"kind": "empty"}
+        elif not use_shm:
+            self.ref = {"kind": "pickle", "arrays": self._arrays}
         else:
             try:
                 self._shm = shared_memory.SharedMemory(create=True, size=nbytes)
@@ -99,11 +111,12 @@ def attached(ref):
             shm.close()
 
 
-def put_cuts(cuts, dim: int) -> StagePayload:
+def put_cuts(cuts, dim: int, use_shm: bool = False) -> StagePayload:
     """[Cut] -> StagePayload（含 group 数组）。"""
     if not cuts:
         return StagePayload(np.zeros(0), np.zeros((0, dim)),
-                            np.zeros(0, dtype=float))
+                            np.zeros(0, dtype=float), use_shm=use_shm)
     return StagePayload(np.array([c.alpha for c in cuts], dtype=float),
                         np.vstack([c.beta for c in cuts]).astype(float),
-                        np.array([c.group for c in cuts], dtype=float))
+                        np.array([c.group for c in cuts], dtype=float),
+                        use_shm=use_shm)

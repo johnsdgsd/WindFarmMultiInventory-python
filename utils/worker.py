@@ -28,11 +28,13 @@ from . import payload as pl
 _W: dict = {}
 
 
-def init_worker(prob, make_sub, cfg, T: int, initial_state, results_dir) -> None:
+def init_worker(prob, make_sub, cfg, T: int, initial_state, results_dir,
+                theta_cap: int = 1) -> None:
     _W["prob"] = prob
     _W["make_sub"] = make_sub
     _W["cfg"] = cfg
     _W["T"] = int(T)
+    _W["theta_cap"] = int(theta_cap)
     _W["dim"] = int(prob.state_dim)
     _W["x0"] = np.round(np.asarray(initial_state, dtype=float).ravel(), 6)
     _W["results_dir"] = None if results_dir is None else Path(results_dir)
@@ -58,21 +60,31 @@ def _fail(where: str, t, scene_ind, sub, exc) -> Exception:
 
 
 # ---------------------------------------------------------------- 模型缓存
-def _shared_sub(t: int, cuts_next, key):
-    """服务 t ≥ 1 的共享模型。首次调用时按 t=1 建 base；t≥1 的 base 结构完全相同，
-    故 t 只进 key（决定换哪一套割行），不影响建模。"""
+def _shared_sub(t: int, cuts_next, key, spec=None):
+    """服务 t ≥ 1 的共享模型。base 按 theta_cap 建一次；本阶段只启用前
+    spec.active_k 个 theta，其余钉 0。t 只进 assemble key，不影响建模。"""
     sub = _W["shared"]
     if sub is None:
-        sub = _W["shared"] = _W["make_sub"](1, _W["prob"], _W["cfg"])
-    sub.assemble(cuts_next, key=key)
+        sub = _W["shared"] = _W["make_sub"](
+            1, _W["prob"], _W["cfg"], n_theta_cap=_W["theta_cap"])
+    if spec is None:
+        sub.assemble(cuts_next, key=key)
+    else:
+        sub.assemble(cuts_next, key=key, active_k=spec.active_k,
+                     weights=spec.weights, layout_gen=spec.layout_gen)
     return sub
 
 
-def _stage0_sub(cuts_next, key):
+def _stage0_sub(cuts_next, key, spec=None):
     sub = _W["stage0"]
     if sub is None:
-        sub = _W["stage0"] = _W["make_sub"](0, _W["prob"], _W["cfg"])
-    sub.assemble(cuts_next, key=key)
+        sub = _W["stage0"] = _W["make_sub"](
+            0, _W["prob"], _W["cfg"], n_theta_cap=_W["theta_cap"])
+    if spec is None:
+        sub.assemble(cuts_next, key=key)
+    else:
+        sub.assemble(cuts_next, key=key, active_k=spec.active_k,
+                     weights=spec.weights, layout_gen=spec.layout_gen)
     return sub
 
 
@@ -85,16 +97,17 @@ def forward_path_task(task):
     返回 (states[1..T], costs[1..T], total_cost, records, 0)；
     最后一个 0 是旧 MIP 回退计数，纯 LP 下恒为 0，保留五元组兼容仿真解包。
     """
-    round_id, path_idx, scene_path, refs, record = task
+    round_id, path_idx, scene_path, refs, specs, record = task
     prob, T = _W["prob"], _W["T"]
     x = _W["x0"].copy()
     states, costs = [], []
     records = [] if record else None
     for t in range(0, T + 1):
+        spec = specs[t]
         with pl.attached(refs[t] if t < T else None) as cuts_next:
-            key = (round_id, t, "fwd")
+            key = (round_id, t, "fwd", spec.cut_gen)
             if t == 0:
-                sub = _stage0_sub(cuts_next, key)
+                sub = _stage0_sub(cuts_next, key, spec)
                 sub.set_state(x)
                 si = -1
             else:
@@ -103,7 +116,7 @@ def forward_path_task(task):
                 # 错位一期 —— 割锚在「下一年」的状态上，阶段 0 面对的初始状态处外推成
                 # 巨额负数，θ ≥ 0 恒胜，下界永远为 0（实测 15 轮 LB 全 0 的真凶）。
                 states.append(x.copy())
-                sub = _shared_sub(t, cuts_next, key)
+                sub = _shared_sub(t, cuts_next, key, spec)
                 si = int(scene_path[t - 1])
                 sub.set_point(x, prob.pool[si])
             try:
@@ -129,10 +142,10 @@ def backward_point_task(task):
     **一任务 = 一个试探点 = 一条割**（用户要求的最小产出单位）。返回 (beta, obj)，
     截距 alpha = obj − beta@x 由主管程算（x 只有主管程有）。
     """
-    round_id, t, trial_idx, x, scene_inds, ref = task
+    round_id, t, trial_idx, x, scene_inds, ref, spec = task
     prob, dim = _W["prob"], _W["dim"]
     with pl.attached(ref) as cuts_next:
-        sub = _shared_sub(t, cuts_next, (round_id, t, "bwd"))
+        sub = _shared_sub(t, cuts_next, (round_id, t, "bwd", spec.cut_gen), spec)
         sub.set_state(x)
         grads = np.empty((len(scene_inds), dim))
         objs = np.empty(len(scene_inds))
@@ -152,10 +165,10 @@ def backward_multicut_task(task):
 
     返回 betas (K,dim), objs (K,)；group=k（场景索引）由主管程写入 Cut。
     """
-    round_id, t, trial_idx, x, scene_inds, ref = task
+    round_id, t, trial_idx, x, scene_inds, ref, spec = task
     prob, dim = _W["prob"], _W["dim"]
     with pl.attached(ref) as cuts_next:
-        sub = _shared_sub(t, cuts_next, (round_id, t, "bwd_multi"))
+        sub = _shared_sub(t, cuts_next, (round_id, t, "bwd_multi", spec.cut_gen), spec)
         sub.set_state(x)
         grads = np.empty((len(scene_inds), dim))
         objs = np.empty(len(scene_inds))
@@ -174,12 +187,12 @@ def backward_cluster_multicut_task(task):
     """固定分区多割：每簇用均值 Θ 解 1 个 LP，返回 L 条未加权割。"""
     from .partition import aggregate_theta
 
-    round_id, t, trial_idx, x, clusters, ref = task
+    round_id, t, trial_idx, x, clusters, ref, spec = task
     prob, dim = _W["prob"], _W["dim"]
     betas = np.empty((len(clusters), dim))
     objs = np.empty(len(clusters))
     with pl.attached(ref) as cuts_next:
-        sub = _shared_sub(t, cuts_next, (round_id, t, "bwd_cmulti"))
+        sub = _shared_sub(t, cuts_next, (round_id, t, "bwd_cmulti", spec.cut_gen), spec)
         sub.set_state(x)
         for k, inds in enumerate(clusters):
             th = aggregate_theta(prob.pool, inds)
@@ -193,12 +206,34 @@ def backward_cluster_multicut_task(task):
     return betas, objs
 
 
+def scene_signatures_task(task):
+    """细化诊断：固定 stage-t 状态，对给定场景块各解一次 LP，返回 π/beta 与 Q。"""
+    round_id, t, trial_idx, x, scene_inds, ref, spec, sig_mode = task
+    prob = _W["prob"]
+    sigs, objs = [], []
+    with pl.attached(ref) as cuts_next:
+        sub = _shared_sub(t, cuts_next, (round_id, t, "sig", spec.cut_gen), spec)
+        sub.set_state(x)
+        for si in scene_inds:
+            sub.set_scene(prob.pool[si])
+            try:
+                sub.solve_lp()
+            except Exception as exc:
+                raise _fail("signature", t, si, sub, exc)
+            if sig_mode == "beta":
+                sigs.append(sub.gradient("dj"))
+            else:
+                sigs.append(sub.dual_signature())
+            objs.append(sub.obj)
+    return np.asarray(sigs, dtype=float), np.asarray(objs, dtype=float)
+
+
 # ---------------------------------------------------------------- 下界任务
 def lower_bound_task(task):
-    """阶段 0 子问题解 LP。割只增不减 ⇒ 下界单调不减，且不依赖随机数。"""
-    round_id, ref = task
+    """阶段 0 子问题解 LP。LML1/细化可让当前 LB 下降；返回当前割集值。"""
+    round_id, ref, spec = task
     with pl.attached(ref) as cuts_next:
-        sub = _stage0_sub(cuts_next, (round_id, 0, "lb"))
+        sub = _stage0_sub(cuts_next, (round_id, 0, "lb", spec.cut_gen), spec)
         sub.set_state(_W["x0"])
         try:
             sub.solve_lp()

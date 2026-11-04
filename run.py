@@ -112,6 +112,10 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
             if eng.cut_selection == "lml1":
                 n_hist = eng.restore_cut_history()
                 print(f"LML1 历史已从割的 state 重建：{n_hist} 条记录")
+            eng.restore_refine_state(meta)
+            if eng.refine_enabled:
+                print(f"细化状态：n_refines={eng.n_refines} "
+                      f"K={min(eng.K[1:eng.T+1]):d}…{max(eng.K[1:eng.T+1]):d}")
             start_iter = int(meta.get("n_iterations", 0)) + 1
             archive_log(d)
             print(f"续训：从 {d} 读回 {sum(len(c) for c in cuts)} 条割，"
@@ -151,13 +155,18 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
         lines = [
             f"结果目录    : {d}",
             f"训练轮次    : {len(hist)}（起始 {start_iter}）",
-            f"下界 LB     : {lb:.6f}",
+            f"下界 LB     : {lb:.6f}   LB_best {eng.lb_best:.6f}",
             f"上界 UB     : {ub:.6f} ± {ci:.6f} (95% CI, {st.n} 条路径)",
             f"间隙 gap    : {gap:.4f} %",
             f"总成本 std  : {st.std:.6f}   最小 {st.lo:.4f}   最大 {st.hi:.4f}",
             f"割数        : {sum(len(c) for c in eng.cuts)}",
-            f"模式        : {eng.mode}  (K={eng.n_theta}"
+            f"模式        : {eng.mode}  ("
+            + (f"theta_cap={eng.n_theta}" if eng.refine_enabled
+               else f"K={eng.n_theta}")
             + (f"，固定分区 {eng.group_mode}" if eng.grouped else "") + ")",
+            f"每阶段 K    : {min(eng.K[1:eng.T+1])} … {max(eng.K[1:eng.T+1])}"
+            f"  theta_cap={eng.theta_cap}"
+            + (f"  refinements={eng.n_refines}" if eng.refine_enabled else ""),
             f"累计求解    : {eng.n_solves}",
             f"用时        : {time.time() - t0:.1f} s",
             "",

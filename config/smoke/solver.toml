@@ -16,6 +16,9 @@ seed = 2026
 n_clusters = 0
 group_mode = "scene"
 
+[io]
+payload_mode = "pickle"
+
 [parallel]
 n_processes = 2                   # 2 进程：冒烟也走一趟多进程链路
 threads_per_process = 1

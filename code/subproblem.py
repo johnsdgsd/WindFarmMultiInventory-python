@@ -65,32 +65,69 @@ def round_repair_n(n, N, digits: int, repair_tol: float) -> np.ndarray:
     return nr
 
 
-def make_stage_subproblem(t, prob, cfg=None):
-    """引擎工厂：只建 base，割由调用方用 assemble 拼装。"""
-    return StageSubproblem(t, prob, cfg)
+def make_stage_subproblem(t, prob, cfg=None, *, n_theta_cap=None,
+                          active_k=None, theta_weights=None):
+    """引擎工厂：只建 base，割由调用方用 assemble 拼装。
+
+    n_theta_cap/active_k/theta_weights 供 B 的 per-stage theta 布局使用；不传
+    时完全走旧的全局 cfg 推导，保证 fixed A / single 逐位兼容。
+    """
+    return StageSubproblem(t, prob, cfg, n_theta_cap=n_theta_cap,
+                           active_k=active_k, theta_weights=theta_weights)
 
 
 class StageSubproblem:
     """第 t 期子问题。t = 0 为虚拟首阶段，t = 1..T 为真实周期。"""
 
-    def __init__(self, t: int, prob, cfg=None):
+    def __init__(self, t: int, prob, cfg=None, *, n_theta_cap=None,
+                 active_k=None, theta_weights=None):
         self.t = int(t)
         self.prob_data = prob
         self.layout = prob.layout
         self.cfg = cfg
         self.mode = str(getattr(cfg, "mode", "single"))
+        from utils.partition import (cluster_weights, fixed_partition,
+                                     resolve_theta_cap)
+        L = 0
         if self.mode == "single":
             self.groups = [list(range(len(prob.pool)))]
-            self.n_theta = 1
-            self.theta_weights = np.array([1.0])
+            base_active = 1
+            base_weights = np.array([1.0])
         else:
             mc = getattr(cfg, "multicut", None)
             L = 0 if mc is None else int(mc.n_clusters)
             gm = "scene" if mc is None else str(mc.group_mode)
-            from utils.partition import cluster_weights, fixed_partition
             self.groups = fixed_partition(prob.pool, len(prob.pool), L, gm)
-            self.n_theta = len(self.groups)
-            self.theta_weights = cluster_weights(self.groups, len(prob.pool))
+            base_active = len(self.groups)
+            base_weights = cluster_weights(self.groups, len(prob.pool))
+        rf = getattr(cfg, "refine", None)
+        refine_cap = 0
+        configured = 0
+        if rf is not None and bool(getattr(rf, "enabled", False)):
+            refine_cap = int(getattr(rf, "max_clusters_per_stage", 0))
+            configured = int(getattr(rf, "theta_cap", 0))
+        if n_theta_cap is None:
+            self.theta_cap = resolve_theta_cap(
+                self.mode, L, len(prob.pool), refine_cap, configured)
+        else:
+            self.theta_cap = int(n_theta_cap)
+        if self.theta_cap < 1:
+            raise ValueError(f"theta_cap 必须 ≥1，实际 {self.theta_cap}")
+        act = base_active if active_k is None else int(active_k)
+        if not 0 <= act <= self.theta_cap:
+            raise ValueError(f"active_k={act} 超出 [0,{self.theta_cap}]")
+        w = (base_weights if theta_weights is None
+             else np.asarray(theta_weights, dtype=float).ravel())
+        if w.size != act:
+            raise ValueError(f"theta_weights 长度 {w.size} ≠ active_k={act}")
+        pad = np.zeros(self.theta_cap)
+        if act:
+            pad[:act] = w
+        self.n_theta = self.theta_cap          # base 里的 theta 变量数
+        self.active_k = act
+        self.theta_weights = pad
+        self._init_active_k = act
+        self._init_weights = pad.copy()
         self._thetas = []
         self.is_virtual = (self.t == 0)
         self._state_vec = None
@@ -103,6 +140,7 @@ class StageSubproblem:
         self._obj = None
         self._last_mip = False
         self._link_rows = {}
+        self._base_rows = []
         self._build()
 
     # -------------------------------------------------------------- base 构建
@@ -147,6 +185,7 @@ class StageSubproblem:
             for r in range(N_R):
                 m.addConstr(I_out[r] + quicksum(o_out[l][r] for l in range(L - 1))
                             + q_out[r] <= float(prob.Imax[r]), name=f"cap_{r}")
+            self._base_rows = list(m.getConstrs())
             return
 
         # ---- 决策变量（全部连续）----
@@ -250,6 +289,8 @@ class StageSubproblem:
         passive = quicksum(float(prob.tc_route[r][mm]) * y[r][mm]
                            for r in range(N_R) for mm in range(N_R))
         m.setObjective(order + holding + downtime + active + passive, COPT.MINIMIZE)
+        # 基础行对偶（π）用于细化签名；必须在挂割之前取，排除 cut 行。
+        self._base_rows = list(m.getConstrs())
 
     # ---------------------------------------------------------------- 内部记账
     def _note_state(self, name, lhs_pairs):
@@ -260,23 +301,45 @@ class StageSubproblem:
         self._state_coeff[name] = a
 
     # ---------------------------------------------------------------- 拼装
-    def assemble(self, cuts_next, key=None) -> "StageSubproblem":
-        """把未来成本割拼装到 base 上。key 与上次相同则跳过。"""
-        if key is not None and key == self._cut_key:
+    def assemble(self, cuts_next, key=None, *, active_k=None, weights=None,
+                 layout_gen=0) -> "StageSubproblem":
+        """把未来成本割拼装到 base 上。
+
+        base 固定建 theta_cap 个 theta；本阶段只用前 active_k 个，其余钉 0 且
+        目标系数 0。active_k/weights 属于“未来阶段”的分区（stage t 消费
+        cuts[t+1]），默认值来自构造参数，兼容旧的固定 K 调用。
+        """
+        act = self._init_active_k if active_k is None else int(active_k)
+        if not 0 <= act <= self.theta_cap:
+            raise ValueError(f"active_k={act} 超出 [0,{self.theta_cap}]")
+        if weights is None:
+            w = self._init_weights[:act].copy()
+        else:
+            w = np.asarray(weights, dtype=float).ravel()
+        if w.size != act:
+            raise ValueError(f"weights 长度 {w.size} ≠ active_k={act}")
+        if act > 0 and abs(float(w.sum()) - 1.0) > 1e-8:
+            raise ValueError(f"active weights 之和 {w.sum():.12g} ≠ 1")
+        padded = np.zeros(self.theta_cap)
+        if act:
+            padded[:act] = w
+        ckey = None if key is None else (
+            key, act, tuple(np.round(w, 12).tolist()), int(layout_gen))
+        if ckey is not None and ckey == self._cut_key:
             return self
         m = self.model
         if self._cut_rows:
             m.remove(list(self._cut_rows))
             self._cut_rows = []
 
-        if cuts_next is None or len(cuts_next[0]) == 0:
-            # 末阶段或空割集：所有 theta 钉在 0。空割集必须走这里，否则 LP 无界。
-            m.setInfo(COPT.Info.LB, self._thetas, 0.0)
-            m.setInfo(COPT.Info.UB, self._thetas, 0.0)
-            m.setInfo(COPT.Info.Obj, self._thetas, 0.0)
-        else:
+        # 先全部钉 0；只有 active 组恢复为自由变量并获得目标权重。
+        m.setInfo(COPT.Info.LB, self._thetas, 0.0)
+        m.setInfo(COPT.Info.UB, self._thetas, 0.0)
+        m.setInfo(COPT.Info.Obj, self._thetas, 0.0)
+        empty = cuts_next is None or len(cuts_next[0]) == 0
+        if not empty and act > 0:
             if len(cuts_next) == 2:
-                if self.n_theta != 1:
+                if act != 1:
                     raise ValueError("multi 模式必须有 group 数组；收到旧式 (alpha,beta)")
                 alpha, beta = cuts_next
                 groups = np.zeros(len(alpha), dtype=int)
@@ -288,10 +351,10 @@ class StageSubproblem:
                 if np.any(np.abs(g - np.rint(g)) > 1e-9):
                     raise ValueError("group 必须是整数")
                 groups = np.rint(g).astype(int)
-                if groups.size and (groups.min() < 0 or groups.max() >= self.n_theta):
+                if groups.size and (groups.min() < 0 or groups.max() >= act):
                     raise ValueError(f"group 越界：{groups.min()}..{groups.max()}，"
-                                     f"K={self.n_theta}")
-            seen = np.zeros(self.n_theta, dtype=bool)
+                                     f"active_k={act}")
+            seen = np.zeros(act, dtype=bool)
             xout = self.x_out
             rows = []
             for i in range(len(alpha)):
@@ -309,11 +372,13 @@ class StageSubproblem:
                 missing = np.flatnonzero(~seen)
                 raise ValueError(f"multi 模式 group 无割，theta 会无界：{missing[:5]}")
             self._cut_rows = rows
-            m.setInfo(COPT.Info.LB, self._thetas, -INF)
-            m.setInfo(COPT.Info.UB, self._thetas, INF)
-            m.setInfo(COPT.Info.Obj, self._thetas,
-                      [float(w) for w in self.theta_weights])
-        self._cut_key = key
+            m.setInfo(COPT.Info.LB, self._thetas[:act], -INF)
+            m.setInfo(COPT.Info.UB, self._thetas[:act], INF)
+            m.setInfo(COPT.Info.Obj, self._thetas[:act],
+                      [float(v) for v in w])
+        self.active_k = act
+        self.theta_weights = padded
+        self._cut_key = ckey if ckey is not None else key
         return self
 
     # ---------------------------------------------------------------- 改参数
@@ -470,6 +535,15 @@ class StageSubproblem:
                 g += a_c * pi
             return g
         raise ValueError(f"未知 method: {method}")
+
+    def dual_signature(self) -> np.ndarray:
+        """基础行（不含割行）的对偶向量 π，用于细化签名。"""
+        if self.is_virtual:
+            raise RuntimeError("虚拟首阶段没有 π 签名")
+        if self._last_mip or self._obj is None:
+            raise RuntimeError(f"stage {self.t}: dual_signature 需要先 solve_lp")
+        vals = self.model.getInfo(COPT.Info.Dual, self._base_rows)
+        return np.asarray(vals, dtype=float).ravel()
 
     def _row(self, name):
         if name not in self._rows:

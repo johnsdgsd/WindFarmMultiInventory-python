@@ -18,10 +18,13 @@ import numpy as np
 # v3 → v4：fleet/dem 右端增加 fleet_tol（纯 LP 浮点容差），可行域改变；
 # v4 → v5：状态流转增加 n 块 round + 小超额修复（state_round_digits/state_repair_tol）。
 # v5 → v6：多割 Cut 增加 group（场景/theta 索引）；single 仍为 group=0。
+# v6 → v7：group 改为“该 stage 自己的 per-stage 分区索引”，meta 存每阶段
+#          layouts/K/weights；v6 的全局固定布局只读兼容（不可续训）。
 # 各版割**语义不同、不可混用** —— load_cuts 会据此拦下旧目录，落实铁律 4
 # （模型改过就必须全新训练）。此后任何约束/状态/目标的改动都要再 +1。
-FORMAT_VERSION = 6
+FORMAT_VERSION = 7
 LEGACY_SINGLE_VERSION = 5   # v5 无 group；仅在 mode=single 时只读兼容
+LEGACY_MULTI_VERSION = 6    # v6 全局固定布局；只读 simulate，不接受 resume
 
 
 @dataclass
@@ -37,7 +40,8 @@ class Cut:
     stage : 生成时所在的期（割近似的是 V_stage）
     obj   : Q(x̄)，逐场景期望/条件目标值
     it    : 创建该割的训练轮次（0 = 初始化平凡割）
-    group : multi 的场景/theta 索引；single 恒为 0。仅内部绑定，不是调参参数。
+    group : multi 的 theta 索引，指向**该 stage 自己的 per-stage 分区**；
+            single 恒为 0。仅内部绑定，不是调参参数。
     """
 
     alpha: float
