@@ -54,8 +54,8 @@ main 可以增加**只含文档/流程**的提交（例如本节的验收协议�
 5. **不可行/无收益**：写清失败原因、参数和数据目录，然后 `git switch main` 回到基线；
    已推送的创新分支保留作证据，不删除、不合并。下一次创新重新从 main 开新分支。
 6. 禁止 force-push、改写 main 历史、删除基线分支；`ada18c3` 是代码回退点。
-7. 远端 `origin/main` 目前仍在 `4ccb80d`；需要远端基线时先单独 `git push origin main`，
-   之后 main 只接受验证通过的合并。
+7. 远端 `origin/main` 当前指向 `e61040f`（文档/流程提交；代码基线仍是 `ada18c3`）。
+   main 只接受验证通过的合并，不直接 push 未验证内容。
 
 ### ★ 算法验收协议（2026-10-25 起）
 
@@ -73,18 +73,58 @@ main 可以增加**只含文档/流程**的提交（例如本节的验收协议�
 - 不可行：先把创新分支推送，再回退 main；外部报告保留，下一轮重新设计。
   目标始终是缩小 gap、加快收敛，不用调参掩盖无收益。
 
-当前分支说明：
+### 当前分支登记（2026-11-06，HEAD = `innov-fixed-cluster` `0414990`）
 
-- `main` / `report-2026-10-23` = `ada18c3` 代码基线；
-- `dg-cser-replay` = DG-CSER 跨阶段回放实验（`32f47c5`，已推送）；period=5 同保存
-  时长仅 13.08% vs 13.63%，**不是基线，不要从它继续创新**；
-- `innov-mcl` = 单调割提升实验（`670daef`，已推送）；根 LB 仅 +0.0039，验收不通过，
-  **不要从它继续创新**；
-- `innov-bl-sddp` = BL-SDDP 本阶段历史回放实验（`6026036`，已推送）；T60 同 3061.7 s
-  gap 13.6608% vs 基线 13.6257%，LB +0.16、UB +0.52（配对不显著），早期收敛更快
-  但最终无改善，验收不通过，**不要从它继续创新**；外部报告
-  `创新-BL-SDDP-验收报告.md`；
-- `algorithm-innovation` 已删除。
+| 分支 | tip | 内容 | 结果 / 状态 | 远端 / tag |
+|---|---|---|---|---|
+| `main` | e61040f | 稳定基线文档与流程；代码基线继承 `ada18c3`；记录 BL-SDDP 验收 | 非 T60 实验参数：`init_mix=[1,0,0,0]` | origin/main |
+| `report-2026-10-23` | ada18c3 | 等级模型 + `fleet_tol`/状态修复 + resume LML1 + T60/T240 报告与测试 | 创新代码基线 | origin/report-2026-10-23 |
+| `exp-param-tune` | 4ec38f9 | T60 参数定标：`init_mix=[0.420,0.369,0.163,0.048]`、127 月龄、`max_train_seconds` | 标准单割基线 `results/base_T60_20261026_204105`（LB 31,573.21 / UB 35,833.32 / gap 11.889%） | origin/exp-param-tune |
+| `innov-adaptive-partition` | 09e1a07 | 自适应场景分区，单粗割；π 签名贪心细化，逐阶段分区；旧割保留 | `results/partT60_20261102_235747`：668 轮 / 7,525.5 s / LB 31,429.91 / UB 35,483.10 / gap 11.423% / 14 次细化 | origin/innov-adaptive-partition |
+| `innov-multicut` | 741afb1 | 标准 SDDP 多割：每场景 1 条割 + 1 个 theta | 全场景多割 T60 pilot 不可行；A 分支父分支 | 仅本地 |
+| `innov-fixed-cluster` | 0414990 | 固定分区簇多割 A：固定 `failure_quantile`，每簇 1 个 theta、1 条聚合均值割，LML1 按簇；L8/L16 正式 | `fcmcT60_full_L8_*`：LB 29,161.35 / UB 34,706.11 / gap 15.98%；`fcmcT60_full_L16_*`：LB 29,494.86 / UB 34,870.50 / gap 15.416% | 本地分支；tag `innov-fixed-cluster-v1` 已推送 |
+| `innov-fixed-cluster-refine` | b54c588 | 固定分区 + 停滞触发细化 B：逐阶段变 K、清割重建、v7 per-stage meta | `refineB_t60_full_n10_*`：251 轮 / LB 29,141.50 / 1000 路径 UB 34,934.47 / gap 16.58%；负结果 | origin/innov-fixed-cluster-refine；tag `innov-fixed-cluster-refine-v1` |
+| `dg-cser-replay` | 32f47c5 | DG-CSER 跨阶段经验回放 | period=5 同保存时间 13.08% vs 13.63%；不是基线 | origin/dg-cser-replay |
+| `innov-mcl` | 670daef | 单调割提升 MCL preflight | 根 LB +0.0039，验收不通过 | origin/innov-mcl |
+| `innov-bl-sddp` | 6026036 | BL-SDDP 本阶段历史状态回放 | T60 同 3061.7 s gap 13.6608% vs 基线 13.6257%，验收不通过 | origin/innov-bl-sddp |
+| `innov-dedup` | 03395c6 | 精确 beta 割去重、行压缩 | LB 相同，仅压缩行 | origin/innov-dedup |
+| `innov-exact-chain` | 0bc848d | 根/状态割增强 preflight | 仅噪声级 LB 变化 | origin/innov-exact-chain |
+| `innov-replay-dedup` | 92014d2 | DG-CSER 回放 + 精确去重组合 | 无收益 | origin/innov-replay-dedup |
+| `innov-root-chain` | 3ade45e | 根策略割链 preflight | 状态采样无法抬高根 LB | origin/innov-root-chain |
+| `innov-strat` | 0331a12 | 分层前向采样 | gap 变差，否决 | origin/innov-strat |
+
+分支关系：
+
+```text
+main / report-2026-10-23 (ada18c3，代码基线)
+        └─ exp-param-tune (4ec38f9，T60 参数与标准单割基线)
+                ├─ innov-adaptive-partition (09e1a07)
+                └─ innov-multicut (741afb1)
+                        └─ innov-fixed-cluster (0414990，tag v1)
+                                └─ innov-fixed-cluster-refine (b54c588，tag v1，负结果)
+```
+
+注意：
+
+- `origin/main` 现在指向 `e61040f`（不是旧的 `4ccb80d`）；`main` 与 `report-2026-10-23` 的代码基线仍是 `ada18c3`。
+- `innov-fixed-cluster` 和 `innov-multicut` 只有本地分支；A 的 tag 已推送，B 的分支和 tag 已推送。
+- `algorithm-innovation` 已删除，不恢复。
+
+### T40 实验登记
+
+T40 是独立问题，不与 T60 比较绝对成本，不能做 T60/T40 路径配对。
+
+| 项 | 值 |
+|---|---|
+| 问题 | T=40；`init_mix=[0.395239,0.371391,0.177223,0.056147]`（age 137，需求匹配）；N/成本/场景池与 T60 相同 |
+| 代码分支 | `exp-param-tune`（4ec38f9）；reflog 显示 2026-10-26 21:58 至 2026-11-02 22:10 在该分支；T40 训练 2026-11-01 04:19–08:31 |
+| 结果目录 | `results/base_T40_age137_4h_20261101_041921`（本地，results 不进 git） |
+| 训练 | 292 轮 / 14,399.5 s；47,552 割 |
+| 官方结果 | LB 21,853.8161；外部 3000 路径 UB 23,583.8593；gap 7.3357% |
+| `run.py` 内部口径 | UB 23,586.5418 ± 273.1036；gap 7.3462%（与外部 path-level 结果略有差异） |
+| 配置 | `...-对比实验\experiments\T60_T40_budget_20261031_200727\config\sddp_T40_age137_4h\{problem,solver}.toml` |
+| 报告 | `...-对比实验\实验结果汇报_T40_4h_20261101.md` |
+| 版本状态 | 对比实验仓库 `window-fair-resume` 工作区中的报告与 `experiments/T60_T40_budget_20261031_200727/` 均为 untracked；不在任何分支上 |
 
 ## 命令与配置
 
