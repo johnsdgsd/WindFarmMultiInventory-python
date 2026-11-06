@@ -85,6 +85,13 @@ main 可以增加**只含文档/流程**的提交（例如本节的验收协议�
   但最终无改善，验收不通过，**不要从它继续创新**；外部报告
   `创新-BL-SDDP-验收报告.md`；
 - `algorithm-innovation` 已删除。
+- `innov-integer-sddp` = Tier 1 整数物流（`1f8c20e`，tag `innov-integer-sddp-v1`，已推送）；
+  T60 200 轮/7,314 s，LB 30,827.80，UB 39,653.94，gap 22.26%；全整数 n/N/F 见 Tier2；
+- `innov-tier2-integer-state` = Tier 2 全整数 n/N/F（`ae30c04`，已推送）；
+  `FORMAT_VERSION=6`，前向 MIP / 后向 LP；T60 193 轮/7,511 s，LB 26,587.73，
+  UB 37,992.49，gap 30.02%；N/F/W/n_out 整数偏差 0、W_out=0 占 73.45%，但 gap
+  不优于 Tier1/V2，**不合并 main**；外部报告
+  `创新-Tier2全整数SDDP-验收报告-20261106.md`。
 
 ## 命令与配置
 
