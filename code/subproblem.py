@@ -79,6 +79,12 @@ class StageSubproblem:
         self.layout = prob.layout
         self.cfg = cfg
         self.is_virtual = (self.t == 0)
+        self.integer_enabled = bool(getattr(cfg, "integer_enabled", False))
+        self.int_mask = (self.layout.logistics_integer_mask()
+                         if self.integer_enabled
+                         else np.zeros(self.layout.dim, dtype=bool))
+        self.int_indices = np.flatnonzero(self.int_mask)
+        self.int_tol = float(getattr(cfg, "int_tol", 1e-6))
         self._state_vec = None
         self._scene = None
         self._cut_rows = []
@@ -101,12 +107,14 @@ class StageSubproblem:
         m = ce.new_model(self.cfg)
         self.model = m
 
-        # 状态：全部连续；只用变量界锁在试验点（路线 A）。
+        # 状态：Tier 1 只把 I/o/q 声明整数；n 保持连续。仍只用变量界锁点。
         q_lo_j = Ly.off_q
         xin, xout = [], []
         for j in range(Ly.dim):
-            xin.append(m.addVar(lb=0.0, ub=float(ub[j]), name=f"xin_{j}"))
-            xout.append(m.addVar(lb=0.0, ub=float(ub[j]), name=f"xout_{j}"))
+            kw = ({"vtype": COPT.INTEGER}
+                  if self.integer_enabled and self.int_mask[j] else {})
+            xin.append(m.addVar(lb=0.0, ub=float(ub[j]), name=f"xin_{j}", **kw))
+            xout.append(m.addVar(lb=0.0, ub=float(ub[j]), name=f"xout_{j}", **kw))
             if self.is_virtual and not (q_lo_j <= j < q_lo_j + Ly.n_q):
                 self._pin_map[j] = float(ub[j])
         self.x_in, self.x_out = xin, xout
@@ -130,19 +138,20 @@ class StageSubproblem:
                             + q_out[r] <= float(prob.Imax[r]), name=f"cap_{r}")
             return
 
-        # ---- 决策变量（全部连续）----
+        # ---- 决策变量：Tier 1 中物流决策整数，n/N/theta 连续 ----
+        kw_int = {"vtype": COPT.INTEGER} if self.integer_enabled else {}
         cap_sum = float(np.sum(prob.Imax + prob.Qmax))
         taup, taum = [], []
         for r in range(N_R):
             up = float(min(cap_sum, prob.Imax[r]))
             dn = float(prob.Imax[r] + prob.Qmax[r])
-            taup.append(m.addVar(lb=0.0, ub=up, name=f"taup_{r}"))
-            taum.append(m.addVar(lb=0.0, ub=dn, name=f"taum_{r}"))
+            taup.append(m.addVar(lb=0.0, ub=up, name=f"taup_{r}", **kw_int))
+            taum.append(m.addVar(lb=0.0, ub=dn, name=f"taum_{r}", **kw_int))
         y = [[m.addVar(lb=0.0, ub=float(min(prob.N[r], prob.Imax[mm])),
-                       name=f"y_{r}_{mm}")
+                       name=f"y_{r}_{mm}", **kw_int)
               for mm in range(N_R)] for r in range(N_R)]
         S_end = [m.addVar(lb=0.0, ub=float(prob.Imax[r] + prob.Qmax[r]),
-                          name=f"send_{r}") for r in range(N_R)]
+                          name=f"send_{r}", **kw_int) for r in range(N_R)]
         tau = [taup[r] - taum[r] for r in range(N_R)]
         self.taup, self.taum, self.y, self.S_end, self.tau = taup, taum, y, S_end, tau
 
@@ -277,14 +286,24 @@ class StageSubproblem:
 
     # ---------------------------------------------------------------- 改参数
     def set_state(self, x, *, require_int: bool = False) -> "StageSubproblem":
-        """锁状态：所有 x_in 的变量界。纯 LP 下允许小数试验点。
+        """锁状态：所有 x_in 的变量界。
 
-        `require_int` 仅为旧脚本兼容保留，当前不做整数校验。
+        Tier 1 只对 I/o/q 掩码要求整数；n 块可为小数。`require_int=False`
+        仅用于 LP 松弛/割有效性诊断，生产前向必须为 True。
         """
         Ly = self.layout
-        v = np.asarray(x, dtype=float).ravel()
+        v = np.asarray(x, dtype=float).ravel().copy()
         if v.size != Ly.dim:
             raise ValueError(f"状态维度 {v.size} ≠ {Ly.dim}")
+        if require_int and self.integer_enabled:
+            vals = v[self.int_indices]
+            iv = np.rint(vals)
+            dev = float(np.max(np.abs(vals - iv))) if vals.size else 0.0
+            if dev > max(self.int_tol, 1e-6):
+                j = int(self.int_indices[int(np.argmax(np.abs(vals - iv)))])
+                raise ValueError(
+                    f"状态分量 {j} 不是整数：{v[j]:.12g}（偏差 {dev:.3e}）")
+            v[self.int_indices] = iv
         ub = Ly.upper(self.prob_data)
         lo = np.minimum(np.maximum(v, 0.0), ub)
         off = np.abs(v - lo) > 1e-3
@@ -336,10 +355,13 @@ class StageSubproblem:
 
     # ---------------------------------------------------------------- 求解
     def solve_mip(self) -> "StageSubproblem":
-        """兼容旧接口；等级模型是纯 LP，生产路径请用 solve_lp。"""
         self._obj = ce.solve(self.model, mip=True)
         self._last_mip = True
         return self
+
+    def solve_forward(self) -> "StageSubproblem":
+        """前向策略：整数模式用 MIP，否则 LP。后向从不调用它。"""
+        return self.solve_mip() if self.integer_enabled else self.solve_lp()
 
     def solve_lp(self) -> "StageSubproblem":
         if not self.is_virtual and self._scene is None:
@@ -361,19 +383,32 @@ class StageSubproblem:
         """本期真实成本（不含 theta）。"""
         return self.obj - self.theta_value()
 
+    def _snap_int_values(self, vals, label: str) -> np.ndarray:
+        a = np.asarray(vals, dtype=float)
+        iv = np.rint(a)
+        dev = float(np.max(np.abs(a - iv))) if a.size else 0.0
+        if dev > max(self.int_tol, 1e-6):
+            raise RuntimeError(
+                f"stage {self.t}: {label} 含非整数 {dev:.3e}（> IntTol）")
+        return iv
+
     def out_state_vector(self) -> np.ndarray:
         """期末状态。虚拟阶段被钉住的分量用期初值。
 
-        n_out 是连续值，LP 解只满足到 FeasTol。这里对 n 块做数值 round：先
-        保留 `state_round_digits` 位小数，再对不超过 `state_repair_tol` 的
-        Σn 超额从最大分量中扣除；超过该值说明是真不可行，直接抛错。I/o/q
-        不改，也不做按比例缩放。
+        Tier 1 整数模式：I/o/q 精确吸附为整数并审计；n 仍按
+        round_repair_n 处理（n 不声明整数）。LP 模式行为不变。
         """
         out = np.asarray(ce.values(self.model, self.x_out), dtype=float)
         if self._pin_map:
             for j in self._pin_map:
                 out[j] = self._state_vec[j]
         Ly = self.layout
+        if self.integer_enabled:
+            out[self.int_indices] = self._snap_int_values(
+                out[self.int_indices], "x_out I/o/q")
+            if not self.is_virtual:
+                se = np.asarray(ce.values(self.model, self.S_end), dtype=float)
+                self._snap_int_values(se, "S_end")
         n = out[Ly.off_n:Ly.off_n + Ly.n_n].reshape(Ly.N_R, Ly.G)
         try:
             n_fixed = round_repair_n(
@@ -386,20 +421,30 @@ class StageSubproblem:
         return out
 
     def decision_values(self) -> dict:
-        """仿真记录用的决策快照。"""
+        """仿真记录用的决策快照；整数模式下对物流决策精确吸附。"""
         Ly = self.layout
-        out = {"q": [float(v) for v in ce.values(self.model, self.x_out[Ly.q_slice()])],
-               "I_out": [float(v) for v in ce.values(self.model, self.x_out[:Ly.n_I])],
+
+        def dec(vals, label):
+            a = np.asarray(vals, dtype=float)
+            if self.integer_enabled and self._last_mip:
+                a = self._snap_int_values(a, label)
+            return a
+
+        out = {"q": [float(v) for v in dec(
+                   ce.values(self.model, self.x_out[Ly.q_slice()]), "q")],
+               "I_out": [float(v) for v in dec(
+                   ce.values(self.model, self.x_out[:Ly.n_I]), "I_out")],
                "theta": self.theta_value()}
         if self.is_virtual:
             return out
         n_in = Ly.n(self._state_vec)
         n_out = Ly.n(self.out_state_vector())
         out.update({
-            "taup": [float(v) for v in ce.values(self.model, self.taup)],
-            "taum": [float(v) for v in ce.values(self.model, self.taum)],
-            "S_end": [float(v) for v in ce.values(self.model, self.S_end)],
-            "y": [[float(v) for v in ce.values(self.model, row)] for row in self.y],
+            "taup": [float(v) for v in dec(ce.values(self.model, self.taup), "taup")],
+            "taum": [float(v) for v in dec(ce.values(self.model, self.taum), "taum")],
+            "S_end": [float(v) for v in dec(ce.values(self.model, self.S_end), "S_end")],
+            "y": [[float(v) for v in dec(ce.values(self.model, row), "y")]
+                  for row in self.y],
             "n_out": n_out.tolist(),
         })
         # 失效/待修诊断（N 不落盘；这里只给标量）

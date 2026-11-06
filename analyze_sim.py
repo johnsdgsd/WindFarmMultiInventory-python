@@ -111,7 +111,8 @@ def main():
             xi, xo_t = x_in[p, t], xo[p, t]
             d = check_stage(prob, Ly, xi, xo_t, q[p, t], taup[p, t], taum[p, t],
                             S_end[p, t], y[p, t], scene[p, t], ub,
-                            F_new=F[p, t])
+                            F_new=F[p, t],
+                            integer_mode=bool(meta.get("integer_mode", False)))
             if t + 1 < T:
                 d["链.状态"] = float(np.abs(x_in[p, t + 1] - xo_t).max())
             npt += 1

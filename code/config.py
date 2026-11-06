@@ -219,6 +219,23 @@ def load_problem_config(path) -> ProblemConfig:
 
 # ------------------------------------------------------------------ 求解配置
 @dataclass
+class IntegerConfig:
+    """Tier 1 整数模式：物流变量整数，n/N/theta 连续。"""
+
+    enabled: bool = False
+    scope: str = "tier1_logistics"
+
+    def __post_init__(self) -> None:
+        if self.scope not in ("tier1_logistics", "none"):
+            raise ValueError(f"[integer] scope 非法：{self.scope!r}")
+        if self.enabled and self.scope != "tier1_logistics":
+            raise ValueError("[integer] enabled=true 时 scope 必须为 tier1_logistics")
+
+    def describe(self) -> str:
+        return f"{'on' if self.enabled else 'off'}  scope={self.scope}"
+
+
+@dataclass
 class SolverConfig:
     # 训练
     iterations: int
@@ -230,6 +247,7 @@ class SolverConfig:
     cut_selection: str
     cut_select_eps: float
     cut_select_keep_rounds: int
+    integer: IntegerConfig
     # 并行
     n_processes: int
     threads_per_process: int
@@ -264,6 +282,14 @@ class SolverConfig:
     def n_forward_paths(self) -> int:
         """前向路径数 = 倍率 × 进程数。默认 1 倍 ⇒ 每阶段试探点数 == 进程数。"""
         return self.forward_paths_per_process * self.n_processes
+
+    @property
+    def integer_enabled(self) -> bool:
+        return bool(self.integer.enabled)
+
+    @property
+    def integer_scope(self) -> str:
+        return str(self.integer.scope)
 
     def __post_init__(self) -> None:
         if self.iterations < 0:
@@ -303,6 +329,7 @@ class SolverConfig:
             f"（{self.forward_paths_per_process} × {self.n_processes} 进程）"
             f"  后向场景 {self.n_backward_samples or '全枚举'}"
             f"  割筛选 {self.cut_selection}"
+            f"  整数 {self.integer.describe()}"
             f"  时限 {self.max_train_seconds or '不限'} s",
             f"并行   进程 {self.n_processes}  每进程 COPT 线程 {self.threads_per_process}",
             f"仿真   路径 {self.n_simulations}  块大小 {self.chunk_size}",
@@ -321,6 +348,16 @@ def load_solver_config(path, *, resolve: bool = True) -> SolverConfig:
     si = _section(raw, "simulation", path.name)
     nu = _section(raw, "numerics", path.name)
     ou = _section(raw, "output", path.name)
+    in_raw = raw.get("integer")
+    if in_raw is None:
+        integer = IntegerConfig()             # 旧配置/基线默认 LP
+    else:
+        if not isinstance(in_raw, dict):
+            raise TypeError(f"配置 {path.name} 的 [integer] 必须是表")
+        integer = IntegerConfig(
+            enabled=bool(_req(in_raw, "enabled", "solver.toml/integer")),
+            scope=str(_req(in_raw, "scope", "solver.toml/integer")),
+        )
     cfg = SolverConfig(
         iterations=int(_req(tr, "iterations", "solver.toml/training")),
         forward_paths_per_process=int(
@@ -333,6 +370,7 @@ def load_solver_config(path, *, resolve: bool = True) -> SolverConfig:
         cut_selection=str(_req(tr, "cut_selection", "solver.toml/training")),
         cut_select_eps=float(_req(tr, "cut_select_eps", "solver.toml/training")),
         cut_select_keep_rounds=int(_req(tr, "cut_select_keep_rounds", "solver.toml/training")),
+        integer=integer,
         n_processes=int(_req(pa, "n_processes", "solver.toml/parallel")),
         threads_per_process=int(_req(pa, "threads_per_process", "solver.toml/parallel")),
         n_simulations=int(_req(si, "n_simulations", "solver.toml/simulation")),
