@@ -107,10 +107,16 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
             cuts, meta = load_cuts(d, prob.T, prob.state_dim)
             m_int = bool(meta.get("integer_mode", False))
             m_scope = str(meta.get("integer_scope", "none"))
-            if m_int != scfg.integer_enabled or m_scope != scfg.integer_scope:
+            m_round = str(meta.get("integer_rounding", "none"))
+            m_n0 = str(meta.get("n0_mode", "continuous"))
+            if (m_int != scfg.integer_enabled or m_scope != scfg.integer_scope
+                    or m_round != scfg.integer_rounding
+                    or m_n0 != prob.n0_mode):
                 raise SystemExit(
-                    f"割文件 integer_mode/scope={m_int}/{m_scope} 与当前 "
-                    f"{scfg.integer_enabled}/{scfg.integer_scope} 不一致，不能续训")
+                    f"割文件 mode/scope/rounding/n0={m_int}/{m_scope}/"
+                    f"{m_round}/{m_n0} 与当前 {scfg.integer_enabled}/"
+                    f"{scfg.integer_scope}/{scfg.integer_rounding}/"
+                    f"{prob.n0_mode} 不一致，不能续训")
             eng.cuts = cuts
             eng.lb_best = float(meta.get("lb_best", 0.0))
             if eng.cut_selection == "lml1":
@@ -144,6 +150,33 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
         print(f"训练完成：{len(hist)} 轮，用时 {time.time() - t0:.1f} s，"
               f"累计求解 {eng.n_solves} 次，LB = {lb:.4f}")
 
+        if int(scfg.n_simulations) <= 0:
+            # 训练与仿真分离：训练只保存 cuts/日志；独立 simulate.py 出 UB/gap/审计。
+            lines = [
+                f"结果目录    : {d}",
+                f"训练轮次    : {len(hist)}（起始 {start_iter}）",
+                f"下界 LB     : {lb:.6f}",
+                f"割数        : {sum(len(c) for c in eng.cuts)}",
+                f"求解口径    : 前向 {'MIP' if scfg.integer_enabled else 'LP'}，"
+                f"后向 LP 松弛"
+                + (f"；integer_scope={scfg.integer_scope}"
+                   f"；rounding={scfg.integer_rounding}"
+                   f"；n0_mode={prob.n0_mode}"
+                   if scfg.integer_scope != "none" else ""),
+                f"MIP 回退    : {sum(r.get('mip_fallback', 0) for r in hist)}",
+                f"累计求解    : {eng.n_solves}",
+                f"训练用时    : {time.time() - t0:.1f} s",
+                "",
+                "训练已完成；按 n_simulations=0 跳过内置仿真。",
+                f"下一步：python simulate.py {d} 3000 1000",
+                "      python analyze_sim.py " + str(d),
+            ]
+            print("\n".join(lines))
+            save_summary(d, "\n".join(lines) + "\n")
+            eng.checkpoint()
+            print(f"已保存：{d}")
+            return d
+
         print(f"仿真 {scfg.n_simulations} 条路径（chunk = {scfg.chunk_size}）…")
         st = simulate(eng, n_paths=scfg.n_simulations, seed=scfg.seed,
                       chunk_size=scfg.chunk_size)
@@ -162,7 +195,10 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
             f"割数        : {sum(len(c) for c in eng.cuts)}",
             f"求解口径    : 前向 {'MIP' if scfg.integer_enabled else 'LP'}，"
             f"后向 LP 松弛"
-            + (f"；integer_scope={scfg.integer_scope}" if scfg.integer_enabled else ""),
+            + (f"；integer_scope={scfg.integer_scope}"
+               f"；rounding={scfg.integer_rounding}"
+               f"；n0_mode={prob.n0_mode}"
+               if scfg.integer_scope != "none" else ""),
             f"MIP 回退    : {sum(r.get('mip_fallback', 0) for r in hist)}",
             f"累计求解    : {eng.n_solves}",
             f"用时        : {time.time() - t0:.1f} s",

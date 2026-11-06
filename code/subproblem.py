@@ -1,7 +1,7 @@
-# subproblem.py — 等级模型单阶段子问题（纯 LP）。
-"""状态布局 I | o | n | q；n[r,i] 为健康等级 i 的运行台数（连续）。
+# subproblem.py — 等级模型单阶段子问题（纯 LP；Tier 1/2 整数扩展）。
+"""状态布局 I | o | n | q；n[r,i] 为健康等级 i 的运行台数。
 
-等级转移（纯 LP，无 F/age/rint）：
+基线（scope=none）：
     N[r,i,j] = Θ[r,i,j] * n_in[r,i]          （Θ 只作系数）
     n_out[r,0] = Y[r] + N[r,0,0]             （Y=Σ_m y）
     n_out[r,j] = Σ_i N[r,i,j]                （j=1..G-1）
@@ -9,13 +9,19 @@
     dem[r]:    Σ_m y[r,m] + Σ_{i,j<G} N[r,i,j] <= N_r + fleet_tol
     fleet[r]:  Σ_i n_in[r,i] <= N_r + fleet_tol   （W_t≥0，容差只吸收 LP 残差）
 
-fleet_tol 是模型/审计的数值容差；状态流转时 out_state_vector 把 n 块 round 到
-state_round_digits 位，并对 ≤ state_repair_tol 的 Σn 超额从最大分量扣除；
-更大的超额直接报错。不做按比例缩放。
+Tier 2（scope=tier2_full）把 n/N/F 全整数化：删除逐格 Ndef 等式，改为
+  · 每个源等级 i 的行和 Σ_j N[r,i,j] = n_in[r,i]；
+  · 尾累计 T[r,i,j]=Σ_{k=j}^G N[r,i,k] 落在 C[r,i,j]·n_in 的最近整数带
+    （C 为 Θ 的尾累计；右端只有 ±0.5 结构常数，Θ 只作 n 的系数）；
+  · N 只建有效弧 j>=i，N 整数；F=Σ_i N[r,i,G] 自动整数。
+这使 W_out=W_in+F-Y 也整数，避免 Tier 1 的分数停机底噪。
+
+fleet_tol 是模型/审计的数值容差；基线/LP 控制的状态流转仍按 state_round_digits
+round，并对 ≤state_repair_tol 的 Σn 超额从最大分量扣除；Tier 2 MIP 跳过该
+分数修正，直接吸附整数并检查行和。
 
 Θ 必须作为 n_in 的系数进入矩阵，不能把 N 算成右端常数——否则对偶看不见
-∂N/∂n，Benders 割会越界。N 的行和由 Θ 行和=1 自动成立，不显式加冗余等式
-（参考库存备件案例：冗余等式会引入对偶退化）。
+∂N/∂n，Benders 割会越界。Tier 2 的尾累计行同样遵守这条。
 
 保留的物流约束：pas / send_def / tau_* / inv / pipe / pipe_last / cap（出侧）。
 容量取期末侧：I_out + Σ o_out + q_out <= Imax（文档 (1) 的期初侧在实现里由
@@ -28,6 +34,7 @@ import numpy as np
 from coptpy import COPT, LinExpr, quicksum
 
 from utils import copt_env as ce
+from .transition import tail_cdf
 
 CUT_EPS = 1e-12
 INF = COPT.INFINITY
@@ -80,7 +87,9 @@ class StageSubproblem:
         self.cfg = cfg
         self.is_virtual = (self.t == 0)
         self.integer_enabled = bool(getattr(cfg, "integer_enabled", False))
-        self.int_mask = (self.layout.logistics_integer_mask()
+        self.integer_scope = str(getattr(cfg, "integer_scope", "none"))
+        self.tier2 = self.integer_scope == "tier2_full"
+        self.int_mask = (self.layout.integer_mask(self.integer_scope)
                          if self.integer_enabled
                          else np.zeros(self.layout.dim, dtype=bool))
         self.int_indices = np.flatnonzero(self.int_mask)
@@ -95,6 +104,8 @@ class StageSubproblem:
         self._obj = None
         self._last_mip = False
         self._link_rows = {}
+        self._tail_rows = {}
+        self._row_sum_rows = {}
         self._build()
 
     # -------------------------------------------------------------- base 构建
@@ -107,7 +118,7 @@ class StageSubproblem:
         m = ce.new_model(self.cfg)
         self.model = m
 
-        # 状态：Tier 1 只把 I/o/q 声明整数；n 保持连续。仍只用变量界锁点。
+        # 状态整数范围由 scope 的 int_mask 决定；仍只用变量界锁点。
         q_lo_j = Ly.off_q
         xin, xout = [], []
         for j in range(Ly.dim):
@@ -161,20 +172,45 @@ class StageSubproblem:
                         name=f"pas_{mm}")
             self._note_state(f"pas_{mm}", [(Ly.ix_I(mm), -1.0)])
 
-        # ---- 等级转移流量 N=Θn（Θ 由 set_scene 逐场景写入系数）----
-        # 完整上三角：j=i..G；j<i 不建变量，P=0 的格用 Θ=0 链接为 0。
+        # ---- 等级转移流量 N（有效弧 j>=i）----
         self.N = [[[None] * (G + 1) for _ in range(G)] for _ in range(N_R)]
+        kw_N = ({"vtype": COPT.INTEGER}
+                if self.tier2 and self.integer_enabled else {})
         for r in range(N_R):
             for i in range(G):
                 for j in range(i, G + 1):
-                    v = m.addVar(lb=0.0, ub=float(prob.N[r]), name=f"N_{r}_{i}_{j}")
+                    v = m.addVar(lb=0.0, ub=float(prob.N[r]),
+                                 name=f"N_{r}_{i}_{j}", **kw_N)
                     self.N[r][i][j] = v
-                    row = m.addConstr(v - n_in[r][i] == 0.0,
-                                      name=f"Ndef_{r}_{i}_{j}")
-                    self._link_rows[(r, i, j)] = row
-                    # 占位：左端 n_in 系数 -1 ⇒ a_c=+1；set_scene 改为 -Θ、a_c=+Θ
-                    self._note_state(f"Ndef_{r}_{i}_{j}",
+                    if not self.tier2:
+                        row = m.addConstr(v - n_in[r][i] == 0.0,
+                                          name=f"Ndef_{r}_{i}_{j}")
+                        self._link_rows[(r, i, j)] = row
+                        # 占位：左端 n_in 系数 -1 ⇒ a_c=+1；set_scene 改为 -Θ、a_c=+Θ
+                        self._note_state(f"Ndef_{r}_{i}_{j}",
+                                         [(Ly.ix_n(r, i), -1.0)])
+
+        if self.tier2:
+            # 行和：Σ_j N=n；尾累计行：T_j 与 C_j·n 的最近整数带。
+            for r in range(N_R):
+                for i in range(G):
+                    row = m.addConstr(
+                        quicksum(self.N[r][i][j] for j in range(i, G + 1))
+                        - n_in[r][i] == 0.0, name=f"Nsum_{r}_{i}")
+                    self._row_sum_rows[(r, i)] = row
+                    self._note_state(f"Nsum_{r}_{i}",
                                      [(Ly.ix_n(r, i), -1.0)])
+                    for j in range(i + 1, G + 1):
+                        expr = quicksum(self.N[r][i][k]
+                                        for k in range(j, G + 1))
+                        row = m.addConstr(
+                            expr, COPT.LESS_EQUAL,
+                            0.5, name=f"Tail_{r}_{i}_{j}")
+                        # 单行范围：下界 -0.5，上界 0.5−ε；set_scene 只改 n 的系数。
+                        m.setInfo(COPT.Info.LB, [row], -0.5)
+                        self._tail_rows[(r, i, j)] = row
+                        self._note_state(f"Tail_{r}_{i}_{j}",
+                                         [(Ly.ix_n(r, i), 0.0)])
 
         # ---- 下一期等级：列和 ----
         for r in range(N_R):
@@ -336,15 +372,28 @@ class StageSubproblem:
         if th.shape != (Ly.N_R, Ly.G, Ly.G + 1):
             raise ValueError(f"Θ 形状 {th.shape} ≠ {(Ly.N_R, Ly.G, Ly.G + 1)}")
         m = self.model
-        for r in range(Ly.N_R):
-            for i in range(Ly.G):
-                j = Ly.ix_n(r, i)
-                for jj in range(i, Ly.G + 1):
-                    c = float(th[r, i, jj])
-                    m.setCoeff(self._link_rows[(r, i, jj)], self.x_in[j], -c)
-                    vec = np.zeros(Ly.dim)
-                    vec[j] = c
-                    self._state_coeff[f"Ndef_{r}_{i}_{jj}"] = vec
+        if self.tier2:
+            ct = tail_cdf(th)
+            for r in range(Ly.N_R):
+                for i in range(Ly.G):
+                    j = Ly.ix_n(r, i)
+                    for jj in range(i + 1, Ly.G + 1):
+                        c = float(ct[r, i, jj])
+                        row = self._tail_rows[(r, i, jj)]
+                        m.setCoeff(row, self.x_in[j], -c)
+                        vec = np.zeros(Ly.dim)
+                        vec[j] = c
+                        self._state_coeff[f"Tail_{r}_{i}_{jj}"] = vec
+        else:
+            for r in range(Ly.N_R):
+                for i in range(Ly.G):
+                    j = Ly.ix_n(r, i)
+                    for jj in range(i, Ly.G + 1):
+                        c = float(th[r, i, jj])
+                        m.setCoeff(self._link_rows[(r, i, jj)], self.x_in[j], -c)
+                        vec = np.zeros(Ly.dim)
+                        vec[j] = c
+                        self._state_coeff[f"Ndef_{r}_{i}_{jj}"] = vec
         self._scene = scene
         return self
 
@@ -405,19 +454,30 @@ class StageSubproblem:
         Ly = self.layout
         if self.integer_enabled:
             out[self.int_indices] = self._snap_int_values(
-                out[self.int_indices], "x_out I/o/q")
+                out[self.int_indices], "x_out")
             if not self.is_virtual:
                 se = np.asarray(ce.values(self.model, self.S_end), dtype=float)
                 self._snap_int_values(se, "S_end")
         n = out[Ly.off_n:Ly.off_n + Ly.n_n].reshape(Ly.N_R, Ly.G)
-        try:
-            n_fixed = round_repair_n(
-                n, self.prob_data.N,
-                self.prob_data.state_round_digits,
-                self.prob_data.state_repair_tol)
-        except ValueError as exc:
-            raise RuntimeError(f"stage {self.t}: {exc}") from exc
-        out[Ly.off_n:Ly.off_n + Ly.n_n] = n_fixed.ravel()
+        if self.tier2 and self.integer_enabled:
+            # Tier 2 的 n 由整数 N 的列和给出；不再做分数 round/repair。
+            n = np.rint(n)
+            excess = n.sum(axis=1) - self.prob_data.N
+            if np.any(excess > float(self.prob_data.fleet_tol) + 1e-9):
+                r = int(np.argmax(excess))
+                raise RuntimeError(
+                    f"stage {self.t}: 仓库 {r+1} 期末 Σn 超机队 "
+                    f"{excess[r]:.3e} > fleet_tol={self.prob_data.fleet_tol:g}")
+            out[Ly.off_n:Ly.off_n + Ly.n_n] = n.ravel()
+        else:
+            try:
+                n_fixed = round_repair_n(
+                    n, self.prob_data.N,
+                    self.prob_data.state_round_digits,
+                    self.prob_data.state_repair_tol)
+            except ValueError as exc:
+                raise RuntimeError(f"stage {self.t}: {exc}") from exc
+            out[Ly.off_n:Ly.off_n + Ly.n_n] = n_fixed.ravel()
         return out
 
     def decision_values(self) -> dict:
@@ -447,13 +507,20 @@ class StageSubproblem:
                   for row in self.y],
             "n_out": n_out.tolist(),
         })
-        # 失效/待修诊断（N 不落盘；这里只给标量）
-        F_new, W_in, W_out = [], [], []
+        Nmat = np.zeros((Ly.N_R, Ly.G, Ly.G + 1), dtype=float)
         for r in range(Ly.N_R):
-            F_new.append(float(sum(float(ce.values(self.model, self.N[r][i][Ly.G]))
-                                   for i in range(Ly.G))))
-            W_in.append(float(self.prob_data.N[r] - n_in[r].sum()))
-            W_out.append(float(self.prob_data.N[r] - n_out[r].sum()))
+            for i in range(Ly.G):
+                for j in range(i, Ly.G + 1):
+                    val = float(ce.values(self.model, self.N[r][i][j]))
+                    if self.tier2 and self.integer_enabled and self._last_mip:
+                        val = float(self._snap_int_values([val], "N")[0])
+                    Nmat[r, i, j] = val
+        if self.tier2:
+            out["N"] = Nmat.tolist()
+        # 失效/待修诊断；Tier 2 的 N 来自整数转移，F 自动整数。
+        F_new = [float(Nmat[r, :, Ly.G].sum()) for r in range(Ly.N_R)]
+        W_in = [float(self.prob_data.N[r] - n_in[r].sum()) for r in range(Ly.N_R)]
+        W_out = [float(self.prob_data.N[r] - n_out[r].sum()) for r in range(Ly.N_R)]
         out["F_new"] = F_new
         out["W_in"] = W_in
         out["W_out"] = W_out

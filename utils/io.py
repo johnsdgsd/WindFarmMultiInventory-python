@@ -77,7 +77,8 @@ def read_config(d) -> dict:
 
 # ------------------------------------------------------- 问题配置一致性校验
 _PROBLEM_KEYS = ("T", "G", "N_R", "L", "N", "Qmax", "Imax", "fleet_tol",
-                 "state_round_digits", "state_repair_tol", "init_mix", "I0",
+                 "state_round_digits", "state_repair_tol", "init_mix",
+                 "n0_mode", "I0",
                  "C", "h", "Cs", "atc", "tc",
                  "lambda0", "dirichlet_s", "p_digits",
                  "beta_cov", "z_bar", "cov", "priority",

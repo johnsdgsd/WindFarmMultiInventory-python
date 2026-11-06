@@ -64,9 +64,9 @@ class StateLayout:
     def q_slice(self) -> slice:
         return slice(self.off_q, self.off_q + self.n_q)
 
-    # ---- 整数掩码（Tier 1 物流整数）----
+    # ---- 整数掩码 ----
     def logistics_integer_mask(self) -> np.ndarray:
-        """I/o/q 状态块为整数；n 块保持连续。"""
+        """Tier 1：I/o/q 状态块为整数；n 块保持连续。"""
         m = np.zeros(self.dim, dtype=bool)
         m[self.off_I:self.off_I + self.n_I] = True
         m[self.off_o:self.off_o + self.n_o] = True
@@ -75,6 +75,17 @@ class StateLayout:
 
     def logistics_integer_indices(self) -> np.ndarray:
         return np.flatnonzero(self.logistics_integer_mask())
+
+    def integer_mask(self, scope: str) -> np.ndarray:
+        """按整数 scope 返回状态整数掩码。Tier 2 包含 n 块，即全部状态。"""
+        if scope == "tier2_full":
+            return np.ones(self.dim, dtype=bool)
+        if scope == "tier1_logistics":
+            return self.logistics_integer_mask()
+        return np.zeros(self.dim, dtype=bool)
+
+    def integer_indices(self, scope: str) -> np.ndarray:
+        return np.flatnonzero(self.integer_mask(scope))
 
     # ---- 界的打包 ----
     def lower(self, prob) -> np.ndarray:

@@ -119,16 +119,25 @@ main 可以增加**只含文档/流程**的提交（例如本节的验收协议�
 cd "D:\WYJ\我的文件\论文\小论文\风场多仓库备件库存管理案例-python"
 P="D:/WYJ/Anaconda/Anaconda3/envs/MyRL/python.exe"
 
-$P run.py                                   # 用 config/ 的配置
+$P run.py                                   # 用 config/ 的配置（只训练）
 $P run.py --config-dir config/smoke         # 换一套配置（冒烟）
 $P run.py 300                               # 覆盖轮数（其余走配置）
-$P run.py 300 2000                          # 覆盖轮数 + 仿真路径数
 $P run.py 200 resume results/<目录>          # 续训
 
 $P simulate.py results/<目录> [路径数] [块大小]   # 仿真一次：统计 + 落 npz + txt 报告
 $P analyze_sim.py results/<目录>                # 读 npz 分析，秒级，不重仿真
 $P plot/plot_bounds.py
 ```
+
+**★ 训练与仿真分离（2026-11-06 用户要求）**：
+- **训练结束后不再跑 `run.py` 内置仿真**，训练配置一律 `[simulation] n_simulations = 0`；
+  `run.py` 只保存 cuts、训练 summary（轮次/LB/割数/用时），不产生 UB/gap。
+- 训练完成后单独跑：
+  ```bash
+  $P simulate.py results/<目录> 3000 1000   # 一次得到 UB/CI/gap + npz + txt 报告
+  $P analyze_sim.py results/<目录>          # 成本结构、调拨、订货、逐期轨迹
+  ```
+- 不要在训练入口里重跑仿真，也不要为每个分析另写脚本重仿真；仿真只跑一次并落盘。
 
 **参数纪律（用户明确要求，别再犯）**：
 - 默认值**只写在 `config/*.toml`**，代码里没有第二处。缺键直接报错，不静默兜底。
@@ -215,6 +224,10 @@ SDDP-for-MILP 框架）。前提是 `Q^LP(·;ω)` 对状态凸 —— 而这要�
 
 **仿真只跑一次、落盘；之后所有统计都读盘。** 别再为每个新需求往 `test/` 写一次性脚本重跑
 仿真 —— 500 条要 ~8 分钟，是纯浪费。
+
+**训练与仿真分离（2026-11-06）**：训练配置必须 `n_simulations = 0`；训练只保存 cuts 和
+训练 summary。训练完成后用 `simulate.py` 一次生成 UB/gap、成本结构、约束审计和 npz，
+再用 `analyze_sim.py` 读盘分析。不要使用 `run.py` 的内置仿真入口。
 
 ```
 simulate.py <结果目录> [路径数] [块大小]   # ① 跑仿真 → 统计 + 落 npz + txt 报告

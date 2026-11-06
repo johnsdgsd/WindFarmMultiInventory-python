@@ -48,13 +48,16 @@ class Dump:
     存 n_out/F/W，供 analyze_sim 不重仿真直接分析。
     """
 
-    def __init__(self, n_paths: int, T: int, Ly, L: int):
+    def __init__(self, n_paths: int, T: int, Ly, L: int, *,
+                 with_N: bool = False):
         P, NR, G = n_paths, Ly.N_R, Ly.G
         sh = {"x_in": (P, T, Ly.dim),
               "q": (P, T, NR), "taup": (P, T, NR), "taum": (P, T, NR),
               "S_end": (P, T, NR), "y": (P, T, NR, NR),
               "n_out": (P, T, NR, G),
               "F": (P, T, NR), "W_in": (P, T, NR), "W_out": (P, T, NR)}
+        if with_N:
+            sh["N"] = (P, T, NR, G, G + 1)
         self.a = {k: np.zeros(s, np.float64) for k, s in sh.items()}
         self.a["cost"] = np.zeros((P, T))
         self.a["terms"] = np.zeros((P, T, 5))
@@ -63,7 +66,8 @@ class Dump:
         self.a["totals"] = np.zeros(P)
 
     def fill(self, k0: int, results, prob, Ly,
-             integer_mode: bool = False) -> tuple[float, dict]:
+             integer_mode: bool = False, integer_scope: str = "none"
+             ) -> tuple[float, dict]:
         """写入第 k0 起的若干条路径，返回 (五项和 vs stage_cost 最大偏差,
         各审计项的逐点最大违约量)。"""
         dev = 0.0
@@ -85,6 +89,8 @@ class Dump:
                 self.a["F"][k, t - 1] = np.asarray(r["F_new"], float)
                 self.a["W_in"][k, t - 1] = np.asarray(r["W_in"], float)
                 self.a["W_out"][k, t - 1] = np.asarray(r["W_out"], float)
+                if "N" in self.a:
+                    self.a["N"][k, t - 1] = np.asarray(r["N"], float)
                 tm = cost_terms(prob, Ly, x, r)
                 self.a["terms"][k, t - 1] = tm
                 self.a["cost"][k, t - 1] = float(r["cost"])
@@ -93,7 +99,8 @@ class Dump:
                 dev = max(dev, abs(tm.sum() - float(r["cost"])))
                 a = check_stage(prob, Ly, x, xo, r["q"], r["taup"], r["taum"],
                                 r["S_end"], r["y"], r["scene"], ub,
-                                F_new=r.get("F_new"), integer_mode=integer_mode)
+                                F_new=r.get("F_new"), integer_mode=integer_mode,
+                                integer_scope=integer_scope, N=r.get("N"))
                 if t < len(states):
                     a["链.状态"] = chain_dev(Ly, x, states[t], r)
                 for c in CHECKS:
@@ -129,7 +136,8 @@ def main(dir_arg: str, n_paths: int, chunk_size: int | None):
 
     eng = SDDPEngine(prob, make_stage_subproblem, scfg, results_dir=d,
                      log=lambda *a, **k: None)
-    dump = Dump(n_paths, T, Ly, prob.L)
+    dump = Dump(n_paths, T, Ly, prob.L,
+                with_N=(scfg.integer_scope == "tier2_full"))
     audit = {c: 0.0 for c in CHECKS}
     dev = 0.0
     t0 = time.time()
@@ -137,10 +145,15 @@ def main(dir_arg: str, n_paths: int, chunk_size: int | None):
         cuts, meta_cuts = load_cuts(d, prob.T, prob.state_dim)
         m_int = bool(meta_cuts.get("integer_mode", False))
         m_scope = str(meta_cuts.get("integer_scope", "none"))
-        if m_int != scfg.integer_enabled or m_scope != scfg.integer_scope:
+        m_round = str(meta_cuts.get("integer_rounding", "none"))
+        m_n0 = str(meta_cuts.get("n0_mode", "continuous"))
+        if (m_int != scfg.integer_enabled or m_scope != scfg.integer_scope
+                or m_round != scfg.integer_rounding
+                or m_n0 != prob.n0_mode):
             raise SystemExit(
-                f"割文件 integer_mode/scope={m_int}/{m_scope} 与配置 "
-                f"{scfg.integer_enabled}/{scfg.integer_scope} 不一致")
+                f"割文件 mode/scope/rounding/n0={m_int}/{m_scope}/{m_round}/{m_n0} "
+                f"与配置 {scfg.integer_enabled}/{scfg.integer_scope}/"
+                f"{scfg.integer_rounding}/{prob.n0_mode} 不一致")
         eng.cuts = cuts
         lb = eng.lower_bound()
         done, blk = 0, 0
@@ -152,7 +165,8 @@ def main(dir_arg: str, n_paths: int, chunk_size: int | None):
             res = eng.forward_paths(sps, record=True)
             n_fb += int(sum(r[4] for r in res))
             dv, au = dump.fill(done, res, prob, Ly,
-                               integer_mode=scfg.integer_enabled)
+                               integer_mode=scfg.integer_enabled,
+                               integer_scope=scfg.integer_scope)
             dev = max(dev, dv)
             for c in CHECKS:
                 audit[c] = max(audit[c], float(au[c]))
@@ -172,7 +186,8 @@ def main(dir_arg: str, n_paths: int, chunk_size: int | None):
     gap = (mean - lb) / abs(mean) * 100 if mean else float("nan")
 
     # ---- 约束审计汇总 ----
-    state_tol = max(TOL, float(prob.state_repair_tol))
+    exact_t2 = (scfg.integer_scope == "tier2_full" and scfg.integer_enabled)
+    state_tol = TOL if exact_t2 else max(TOL, float(prob.state_repair_tol))
     bad = {c: m for c, m in audit.items()
            if m > (state_tol if c in STATE_NUMERIC_CHECKS else TOL)}
     # ---- 成本结构 ----
@@ -181,9 +196,11 @@ def main(dir_arg: str, n_paths: int, chunk_size: int | None):
     stage_mean = dump.a["cost"].mean(axis=0)
 
     np.savez_compressed(npz, **dump.a)
-    meta = {"dir": d.name, "model": "markov_grade", "schema": 3,
+    meta = {"dir": d.name, "model": "markov_grade", "schema": 4,
             "integer_mode": bool(scfg.integer_enabled),
             "integer_scope": str(scfg.integer_scope),
+            "integer_rounding": str(scfg.integer_rounding),
+            "n0_mode": str(prob.n0_mode),
             "forward_solver": ("mip" if scfg.integer_enabled else "lp"),
             "mip_fallback": int(n_fb),
             "n_paths": n_paths, "chunk_size": chunk, "T": T,

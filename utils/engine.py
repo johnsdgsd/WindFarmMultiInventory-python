@@ -54,6 +54,12 @@ class SDDPEngine:
         self.cfg = cfg
         self.T = int(prob.T)
         self.state_dim = int(prob.state_dim)
+        if str(getattr(cfg, "integer_scope", "none")) == "tier2_full":
+            if str(getattr(prob, "n0_mode", "continuous")) != "integer_largest_remainder":
+                raise ValueError(
+                    "Tier 2 要求 problem.toml 的 [fleet] n0_mode="
+                    "integer_largest_remainder，当前为 "
+                    f"{getattr(prob, 'n0_mode', 'continuous')!r}")
         self.initial_state = np.round(
             np.asarray(prob.initial_state(), dtype=float).ravel(), 6)
 
@@ -313,6 +319,9 @@ class SDDPEngine:
                        "sim": sim, "time": elapsed,
                        "solves": self.n_solves, "mip_fallback": n_fb,
                        "integer_mode": bool(getattr(self.cfg, "integer_enabled", False)),
+                       "integer_scope": str(getattr(self.cfg, "integer_scope", "none")),
+                       "integer_rounding": str(getattr(self.cfg, "integer_rounding",
+                                                       "none")),
                        "forward_solver": ("mip" if getattr(self.cfg, "integer_enabled",
                                                           False) else "lp"),
                        "n_cuts": sum(len(c) for c in self.cuts[1:]),
@@ -357,6 +366,8 @@ class SDDPEngine:
                 "n_scenes": self.n_scenes,
                 "integer_mode": bool(getattr(self.cfg, "integer_enabled", False)),
                 "integer_scope": str(getattr(self.cfg, "integer_scope", "none")),
+                "integer_rounding": str(getattr(self.cfg, "integer_rounding", "none")),
+                "n0_mode": str(getattr(self.prob, "n0_mode", "continuous")),
                 "forward_solver": ("mip" if getattr(self.cfg, "integer_enabled", False)
                                    else "lp"),
                 "n_iterations": self.last_iter,

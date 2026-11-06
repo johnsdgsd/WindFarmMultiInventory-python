@@ -36,7 +36,7 @@ def init_worker(prob, make_sub, cfg, T: int, initial_state, results_dir) -> None
     _W["integer"] = bool(getattr(cfg, "integer_enabled", False))
     x0 = np.round(np.asarray(initial_state, dtype=float).ravel(), 6)
     if _W["integer"]:
-        m = prob.layout.logistics_integer_mask()
+        m = prob.layout.integer_mask(str(getattr(cfg, "integer_scope", "none")))
         x0[m] = np.rint(x0[m])
     _W["x0"] = x0
     _W["results_dir"] = None if results_dir is None else Path(results_dir)

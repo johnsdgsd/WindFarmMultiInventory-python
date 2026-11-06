@@ -17,9 +17,10 @@ import numpy as np
 # v2 → v3：月龄/Beta/F=rint → 等级/Poisson/Dirichlet/N=Θn 的纯 LP 模型；
 # v3 → v4：fleet/dem 右端增加 fleet_tol（纯 LP 浮点容差），可行域改变；
 # v4 → v5：状态流转增加 n 块 round + 小超额修复（state_round_digits/state_repair_tol）。
+# v5 → v6：Tier 2 全整数 n/N/F，N=Θn 改为尾累计确定性取整；初始 n0 整数化。
 # 各版割**语义不同、不可混用** —— load_cuts 会据此拦下旧目录，落实铁律 4
 # （模型改过就必须全新训练）。此后任何约束/状态/目标的改动都要再 +1。
-FORMAT_VERSION = 5
+FORMAT_VERSION = 6
 
 
 @dataclass

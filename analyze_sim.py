@@ -60,8 +60,15 @@ def main():
             or int(meta.get("G", -1)) != G
             or int(meta.get("state_dim", -1)) != Ly.dim):
         raise SystemExit("这份 npz 是旧月龄模型/旧 schema，等级模型请用当前代码重跑 simulate.py")
+    scope = str(meta.get("integer_scope", "none"))
+    integer_mode = bool(meta.get("integer_mode", False))
+    if scope == "tier2_full" and int(meta.get("schema", 0)) < 4:
+        raise SystemExit("Tier2 npz 缺少 schema=4/N 字段；请重新运行 simulate.py")
     P = int(meta["n_paths"])
     z = np.load(f)
+    N = z["N"].astype(float) if "N" in z else None
+    if scope == "tier2_full" and N is None:
+        raise SystemExit("Tier2 npz 缺少 N 字段；请重新运行 simulate.py")
     x_in = z["x_in"].astype(float)
     q = z["q"].astype(float)
     taup, taum = z["taup"].astype(float), z["taum"].astype(float)
@@ -89,6 +96,9 @@ def main():
 
     print(f"{f.name}   路径 {P} × {T} 期   种子 {meta['seed']} "
           f"块 {meta.get('chunk_size', '—')}")
+    print(f"integer_mode={integer_mode}  scope={scope}  "
+          f"rounding={meta.get('integer_rounding', 'none')}  "
+          f"n0_mode={meta.get('n0_mode', 'continuous')}")
     if "mean" in meta:
         print(f"UB {meta['mean']:,.1f} ± {meta['ci95']:,.1f}   LB {meta['lb']:,.1f}   "
               f"gap {meta['gap_pct']:.3f}%")
@@ -111,15 +121,17 @@ def main():
             xi, xo_t = x_in[p, t], xo[p, t]
             d = check_stage(prob, Ly, xi, xo_t, q[p, t], taup[p, t], taum[p, t],
                             S_end[p, t], y[p, t], scene[p, t], ub,
-                            F_new=F[p, t],
-                            integer_mode=bool(meta.get("integer_mode", False)))
+                            F_new=F[p, t], integer_mode=integer_mode,
+                            integer_scope=scope,
+                            N=(N[p, t] if N is not None else None))
             if t + 1 < T:
                 d["链.状态"] = float(np.abs(x_in[p, t + 1] - xo_t).max())
             npt += 1
             for c in CHECKS:
                 if c in d:
                     bad[c] = max(bad.get(c, 0.0), float(d[c]))
-    state_tol = max(TOL, float(prob.state_repair_tol))
+    exact_t2 = (scope == "tier2_full" and integer_mode)
+    state_tol = TOL if exact_t2 else max(TOL, float(prob.state_repair_tol))
     viol = {k: v for k, v in bad.items()
             if v > (state_tol if k in STATE_NUMERIC_CHECKS else TOL)}
     print(f"  共核对 {npt:,} 个 (路径,期) 点，等级/N/F 等式按 N_R×G 计")

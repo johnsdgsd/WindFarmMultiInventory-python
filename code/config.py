@@ -68,6 +68,8 @@ class ProblemConfig:
     state_repair_tol: float   # 只修正不超过该值的 Σn 超额（台）
     # 初始等级分布（长度 G、非负、和为 1）；[1,0,..] = 全新机队
     init_mix: list
+    # 初始 n0 口径：continuous（旧模型）或 integer_largest_remainder（Tier 2）
+    n0_mode: str
     # 各仓初始可用库存（长度 N_R，台）；旧配置缺省全 0
     I0: list
     # 成本
@@ -131,6 +133,9 @@ class ProblemConfig:
         s = float(sum(self.init_mix))
         if abs(s - 1.0) > 1e-8:
             raise ValueError(f"[fleet] init_mix 必须和为 1，实际 {s}")
+
+        if self.n0_mode not in ("continuous", "integer_largest_remainder"):
+            raise ValueError(f"[fleet] n0_mode 非法：{self.n0_mode!r}")
 
         if len(self.I0) != self.N_R:
             raise ValueError(f"[fleet] I0 长度 {len(self.I0)} ≠ N_R={self.N_R}")
@@ -196,6 +201,7 @@ def load_problem_config(path) -> ProblemConfig:
         state_repair_tol=float(_req(fleet, "state_repair_tol",
                                     "problem.toml/fleet")),
         init_mix=[float(v) for v in _req(fleet, "init_mix", "problem.toml/fleet")],
+        n0_mode=str(_opt(fleet, "n0_mode", "continuous", "problem.toml/fleet")),
         I0=[float(v) for v in _opt(fleet, "I0", [0.0] * N_R,
                                    "problem.toml/fleet")],
         C=float(_req(cost, "C", "problem.toml/cost")),
@@ -220,19 +226,34 @@ def load_problem_config(path) -> ProblemConfig:
 # ------------------------------------------------------------------ 求解配置
 @dataclass
 class IntegerConfig:
-    """Tier 1 整数模式：物流变量整数，n/N/theta 连续。"""
+    """整数模式。
+
+    scope=tier1_logistics：只整数化物流变量，n/N 连续。
+    scope=tier2_full：n/N/F 全整数；enabled=false 时仍是同一 Tier 2 模型的 LP 松弛。
+    """
 
     enabled: bool = False
     scope: str = "tier1_logistics"
+    rounding: str = "none"
 
     def __post_init__(self) -> None:
-        if self.scope not in ("tier1_logistics", "none"):
+        if self.scope not in ("tier1_logistics", "tier2_full", "none"):
             raise ValueError(f"[integer] scope 非法：{self.scope!r}")
-        if self.enabled and self.scope != "tier1_logistics":
-            raise ValueError("[integer] enabled=true 时 scope 必须为 tier1_logistics")
+        if self.enabled and self.scope == "none":
+            raise ValueError("[integer] enabled=true 时 scope 不能为 none")
+        if self.scope == "tier2_full":
+            if self.rounding != "cumulative_tail_nearest":
+                raise ValueError(
+                    "[integer] tier2_full 的 rounding 必须为 "
+                    "'cumulative_tail_nearest'")
+        elif self.rounding != "none":
+            raise ValueError(
+                f"[integer] scope={self.scope} 时 rounding 必须为 none")
 
     def describe(self) -> str:
-        return f"{'on' if self.enabled else 'off'}  scope={self.scope}"
+        tail = (f"  rounding={self.rounding}"
+                if self.scope == "tier2_full" else "")
+        return f"{'on' if self.enabled else 'off'}  scope={self.scope}{tail}"
 
 
 @dataclass
@@ -290,6 +311,10 @@ class SolverConfig:
     @property
     def integer_scope(self) -> str:
         return str(self.integer.scope)
+
+    @property
+    def integer_rounding(self) -> str:
+        return str(self.integer.rounding)
 
     def __post_init__(self) -> None:
         if self.iterations < 0:
@@ -354,9 +379,15 @@ def load_solver_config(path, *, resolve: bool = True) -> SolverConfig:
     else:
         if not isinstance(in_raw, dict):
             raise TypeError(f"配置 {path.name} 的 [integer] 必须是表")
+        scope = str(_req(in_raw, "scope", "solver.toml/integer"))
+        rounding = (str(_req(in_raw, "rounding", "solver.toml/integer"))
+                    if scope == "tier2_full"
+                    else str(_opt(in_raw, "rounding", "none",
+                                  "solver.toml/integer")))
         integer = IntegerConfig(
             enabled=bool(_req(in_raw, "enabled", "solver.toml/integer")),
-            scope=str(_req(in_raw, "scope", "solver.toml/integer")),
+            scope=scope,
+            rounding=rounding,
         )
     cfg = SolverConfig(
         iterations=int(_req(tr, "iterations", "solver.toml/training")),

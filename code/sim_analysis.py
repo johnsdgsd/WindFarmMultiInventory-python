@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import numpy as np
 
+from .transition import tail_cdf
+
 TERMS = ("采购", "持有", "停机", "主动调拨", "被动调拨")
 
 CHECKS = ("pas", "fleet", "dem", "grade0", "grade", "N链接", "结构零",
           "F_new", "W守恒", "send_def", "tau_bal", "tau_lo", "tau_hi",
           "tau_src", "inv", "pipe", "pipe_last", "cap", "界.下", "界.上",
-          "整数", "链.状态")
+          "整数", "整数.N", "整数.n", "整数.F", "整数.W", "尾取整", "链.状态")
 
 # 状态流转的 round/repair 会轻微改动 n_out；这三项用 state_repair_tol 审计。
 STATE_NUMERIC_CHECKS = ("grade0", "grade", "W守恒")
@@ -37,8 +39,10 @@ def out_state(Ly, x_in, rec) -> np.ndarray:
     return xo
 
 
-def F_of(prob, Ly, x_in, scene) -> np.ndarray:
-    """由 n_in 与场景 Θ 计算本期新失效 F_new = Σ_i N[i,G]。"""
+def F_of(prob, Ly, x_in, scene, N=None) -> np.ndarray:
+    """由 n_in 与场景 Θ（或显式整数 N）计算本期新失效 F_new=Σ_i N[i,G]。"""
+    if N is not None:
+        return np.asarray(N, dtype=float)[:, :, Ly.G].sum(axis=1)
     th = np.asarray(scene[1], float)
     n = Ly.n(x_in)
     N = th * n[:, :, None]
@@ -62,14 +66,14 @@ def cost_terms(prob, Ly, x_in, rec) -> np.ndarray:
 
 
 def check_stage(prob, Ly, x, xo, q_out, taup, taum, S, y, scene_idx, ub,
-                F_new=None, integer_mode: bool = False) -> dict:
+                F_new=None, integer_mode: bool = False,
+                integer_scope: str = "none", N=None) -> dict:
     """核对一期，返回 {核对项: 该期最大违约量}（≤ TOL 视为合规）。
 
-    N 由 n_in + 场景 Θ 重算（与模型里的 N=Θn 链接等价）。F_new 可选：
-    传入仿真记录的 F 时，核对记录值与重算值；不传则该项为 0。
-    fleet/dem 的右端与子问题一致为 N_r + fleet_tol：容差内的 LP 残差不算违规。
-    grade0/grade/W守恒 会因状态 round/repair 有 ≤state_repair_tol 的偏差，
-    simulate/analyze 对这三项用 STATE_NUMERIC_CHECKS 的阈值审计。
+    baseline/Tier1：N=Θn 由 n_in+场景重算；Tier2：必须传入仿真实录的 N，
+    用 N 检查行和、尾取整和 F=Σ_i N[i,G]（不能用 Θn 重算，否则会系统性误报）。
+    F_new 可选：传入时核对记录值。fleet/dem 右端为 N_r+fleet_tol。
+    grade0/grade/W守恒 在 Tier2 MIP 中应精确；阈值由调用方按 scope 选择。
     """
     NR, G, L = Ly.N_R, Ly.G, Ly.L
     n_in, I_in, o_in, q_in = Ly.n(x), Ly.I(x), Ly.o(x), Ly.q(x)
@@ -81,18 +85,32 @@ def check_stage(prob, Ly, x, xo, q_out, taup, taum, S, y, scene_idx, ub,
     S = np.asarray(S, float)
     tau = taup - taum
     th = np.asarray(prob.pool[int(scene_idx)][1], float)
+    tier2 = str(integer_scope) == "tier2_full"
 
-    N = th * n_in[:, :, None]                     # (NR,G,G+1)
-    F_rec = N[:, :, G].sum(axis=1)
+    if tier2:
+        if N is None:
+            raise ValueError("Tier2 审计必须传入仿真实录的 N")
+        N = np.asarray(N, dtype=float)
+        if N.shape != (NR, G, G + 1):
+            raise ValueError(f"Tier2 N 形状 {N.shape} ≠ {(NR, G, G + 1)}")
+        F_rec = N[:, :, G].sum(axis=1)
+        zero_dev = 0.0
+        for r in range(NR):
+            for i in range(G):
+                zero_dev = max(zero_dev, float(np.max(np.abs(N[r, i, :i])))
+                               if i else 0.0)
+    else:
+        N = th * n_in[:, :, None]                 # (NR,G,G+1)
+        F_rec = N[:, :, G].sum(axis=1)
+        zero_dev = 0.0
+        for i in range(G):
+            if i:
+                zero_dev = max(zero_dev, float(np.max(np.abs(th[:, i, :i]))))
+
     Y = y.sum(axis=1)
     W_in = prob.N - n_in.sum(axis=1)
     W_out = prob.N - n_out.sum(axis=1)
 
-    # 结构零：j<i 必须为 0
-    zero_dev = 0.0
-    for i in range(G):
-        if i:
-            zero_dev = max(zero_dev, float(np.max(np.abs(th[:, i, :i]))))
     row_dev = float(np.max(np.abs(N.sum(axis=2) - n_in)))
     f_dev = (float(np.max(np.abs(np.asarray(F_new, float) - F_rec)))
              if F_new is not None else 0.0)
@@ -136,8 +154,21 @@ def check_stage(prob, Ly, x, xo, q_out, taup, taum, S, y, scene_idx, ub,
         "界.下": float(np.maximum(-x, 0).max()),
         "界.上": float(np.maximum(x - ub, 0).max()),
     }
+
+    if tier2:
+        ct = tail_cdf(th)
+        tail_err = 0.0
+        for r in range(NR):
+            for i in range(G):
+                for j in range(i + 1, G + 1):
+                    t = float(N[r, i, j:].sum())
+                    tail_err = max(tail_err,
+                                   abs(t - float(ct[r, i, j]) * float(n_in[r, i])))
+        # 取整带是 ±0.5；只把超过 0.5 的部分上报为违约量。
+        d["尾取整"] = max(0.0, tail_err - 0.5)
+
     if integer_mode:
-        mask = Ly.logistics_integer_mask()
+        mask = Ly.integer_mask(integer_scope)
         vals = [np.asarray(x, float)[mask], np.asarray(xo, float)[mask],
                 q_out, taup, taum, S, y]
         dev = 0.0
@@ -148,6 +179,19 @@ def check_stage(prob, Ly, x, xo, q_out, taup, taum, S, y, scene_idx, ub,
         d["整数"] = dev
     else:
         d["整数"] = 0.0
+
+    if tier2:
+        if integer_mode:
+            d["整数.N"] = float(np.max(np.abs(N - np.rint(N))))
+            n_blocks = np.concatenate([np.asarray(x, float)[
+                Ly.off_n:Ly.off_n + Ly.n_n], np.asarray(xo, float)[
+                Ly.off_n:Ly.off_n + Ly.n_n]])
+            d["整数.n"] = float(np.max(np.abs(n_blocks - np.rint(n_blocks))))
+            d["整数.F"] = float(np.max(np.abs(F_rec - np.rint(F_rec))))
+            ww = np.concatenate([np.asarray(W_in, float), np.asarray(W_out, float)])
+            d["整数.W"] = float(np.max(np.abs(ww - np.rint(ww))))
+        else:
+            d["整数.N"] = d["整数.n"] = d["整数.F"] = d["整数.W"] = 0.0
     return d
 
 

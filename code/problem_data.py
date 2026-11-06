@@ -20,6 +20,7 @@ import numpy as np
 
 from .config import ProblemConfig
 from .state_layout import StateLayout
+from .transition import largest_remainder_counts
 
 COV_NAMES = ("mu_T", "sigma_T", "lambda", "alpha_L", "beta_L")
 
@@ -163,7 +164,8 @@ class ProblemData:
     L: int
     # ---- 机队与初值 ----
     N: np.ndarray
-    n0: np.ndarray            # (N_R,G)，可为小数（初始等级分布）
+    n0: np.ndarray            # (N_R,G)：continuous 时可小数；Tier 2 为整数
+    n0_mode: str              # continuous | integer_largest_remainder
     I0: np.ndarray
     o0: np.ndarray            # (L-1,N_R)
     init_mix: np.ndarray      # (G,)
@@ -254,12 +256,19 @@ def DefineProblem(cfg: ProblemConfig) -> ProblemData:
     priority = default_priority(N_R) if cfg.priority is None else cfg.priority
     tc_route = make_tc_route(priority, cfg.tc, N_R)
 
-    # 初始等级分布：每仓 N_r * init_mix
-    n0 = np.outer(N.astype(float), init_mix)
+    # 初始等级分布：continuous = 每仓 N_r * init_mix；Tier 2 = 最大余数整数化
+    if cfg.n0_mode == "integer_largest_remainder":
+        n0 = np.vstack([largest_remainder_counts(int(N[r]), init_mix)
+                        for r in range(N_R)]).astype(float)
+    else:
+        n0 = np.outer(N.astype(float), init_mix)
     o0 = np.zeros((L - 1, N_R), dtype=float)
     for r in range(N_R):
         if abs(float(n0[r].sum()) - float(N[r])) > 1e-8:
             raise ValueError(f"仓库 {r+1} 初始等级分布和 ≠ N={N[r]}")
+        if cfg.n0_mode == "integer_largest_remainder":
+            if np.max(np.abs(n0[r] - np.rint(n0[r]))) > 1e-9:
+                raise ValueError(f"仓库 {r+1} 的 n0 不是整数：{n0[r].tolist()}")
 
     P_ref = transition_matrix(cfg.lambda0, G, cfg.p_digits)
     pool = sample_pool(cfg.lambda0, beta_cov, z_bar, cov, N_R, G,
@@ -267,7 +276,8 @@ def DefineProblem(cfg: ProblemConfig) -> ProblemData:
                        cfg.pool_size, cfg.seed)
 
     return ProblemData(
-        T=T, G=G, N_R=N_R, L=L, N=N, n0=n0, I0=I0, o0=o0,
+        T=T, G=G, N_R=N_R, L=L, N=N, n0=n0, n0_mode=cfg.n0_mode,
+        I0=I0, o0=o0,
         init_mix=init_mix,
         C=cfg.C, h=cfg.h, Cs=cfg.Cs, atc=cfg.atc, tc=cfg.tc,
         Qmax=Qmax, Imax=Imax, fleet_tol=cfg.fleet_tol,
@@ -288,6 +298,7 @@ def to_json(prob: ProblemData) -> dict:
         "schema": 1,
         "T": prob.T, "G": prob.G, "N_R": prob.N_R, "L": prob.L,
         "N": prob.N.tolist(), "n0": prob.n0.tolist(),
+        "n0_mode": prob.n0_mode,
         "I0": prob.I0.tolist(), "o0": prob.o0.tolist(),
         "init_mix": prob.init_mix.tolist(),
         "C": prob.C, "h": prob.h, "Cs": prob.Cs, "atc": prob.atc, "tc": prob.tc,
@@ -314,6 +325,7 @@ def from_json(d: dict) -> ProblemData:
         T=int(d["T"]), G=G, N_R=N_R, L=L,
         N=np.asarray(d["N"], dtype=np.int64),
         n0=np.asarray(d["n0"], dtype=float),
+        n0_mode=str(d.get("n0_mode", "continuous")),
         I0=np.asarray(d["I0"], dtype=float),
         o0=np.asarray(d["o0"], dtype=float),
         init_mix=np.asarray(d["init_mix"], dtype=float),
@@ -348,7 +360,8 @@ def print_summary(prob: ProblemData, out=print) -> None:
     out(f"T = {prob.T}  G = {G}  N_R = {prob.N_R}  L = {prob.L}  "
         f"pool = {len(prob.pool)}  seed = {prob.seed}  状态维 = {prob.state_dim}")
     out(f"机队 N = {prob.N.tolist()}  总数 = {int(prob.N.sum())}  "
-        f"init_mix = {prob.init_mix.tolist()}  I0 = {prob.I0.tolist()}  "
+        f"init_mix = {prob.init_mix.tolist()}  n0_mode = {prob.n0_mode}  "
+        f"n0 = {np.round(prob.n0, 3).tolist()}  I0 = {prob.I0.tolist()}  "
         f"fleet_tol = {prob.fleet_tol:g}  "
         f"state_round_digits = {prob.state_round_digits}  "
         f"state_repair_tol = {prob.state_repair_tol:g}")
