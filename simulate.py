@@ -62,7 +62,8 @@ class Dump:
         self.a["scene"] = np.zeros((P, T), np.int16)
         self.a["totals"] = np.zeros(P)
 
-    def fill(self, k0: int, results, prob, Ly) -> tuple[float, dict]:
+    def fill(self, k0: int, results, prob, Ly,
+             integer_mode: bool = False) -> tuple[float, dict]:
         """写入第 k0 起的若干条路径，返回 (五项和 vs stage_cost 最大偏差,
         各审计项的逐点最大违约量)。"""
         dev = 0.0
@@ -92,7 +93,7 @@ class Dump:
                 dev = max(dev, abs(tm.sum() - float(r["cost"])))
                 a = check_stage(prob, Ly, x, xo, r["q"], r["taup"], r["taum"],
                                 r["S_end"], r["y"], r["scene"], ub,
-                                F_new=r.get("F_new"))
+                                F_new=r.get("F_new"), integer_mode=integer_mode)
                 if t < len(states):
                     a["链.状态"] = chain_dev(Ly, x, states[t], r)
                 for c in CHECKS:
@@ -134,15 +135,24 @@ def main(dir_arg: str, n_paths: int, chunk_size: int | None):
     t0 = time.time()
     try:
         cuts, meta_cuts = load_cuts(d, prob.T, prob.state_dim)
+        m_int = bool(meta_cuts.get("integer_mode", False))
+        m_scope = str(meta_cuts.get("integer_scope", "none"))
+        if m_int != scfg.integer_enabled or m_scope != scfg.integer_scope:
+            raise SystemExit(
+                f"割文件 integer_mode/scope={m_int}/{m_scope} 与配置 "
+                f"{scfg.integer_enabled}/{scfg.integer_scope} 不一致")
         eng.cuts = cuts
         lb = eng.lower_bound()
         done, blk = 0, 0
+        n_fb = 0
         while done < n_paths:
             n = min(chunk, n_paths - done)
             rng = np.random.default_rng(scfg.seed + blk)
             sps = [rng.integers(0, eng.n_scenes, size=T).tolist() for _ in range(n)]
             res = eng.forward_paths(sps, record=True)
-            dv, au = dump.fill(done, res, prob, Ly)
+            n_fb += int(sum(r[4] for r in res))
+            dv, au = dump.fill(done, res, prob, Ly,
+                               integer_mode=scfg.integer_enabled)
             dev = max(dev, dv)
             for c in CHECKS:
                 audit[c] = max(audit[c], float(au[c]))
@@ -171,7 +181,11 @@ def main(dir_arg: str, n_paths: int, chunk_size: int | None):
     stage_mean = dump.a["cost"].mean(axis=0)
 
     np.savez_compressed(npz, **dump.a)
-    meta = {"dir": d.name, "model": "markov_grade", "schema": 2,
+    meta = {"dir": d.name, "model": "markov_grade", "schema": 3,
+            "integer_mode": bool(scfg.integer_enabled),
+            "integer_scope": str(scfg.integer_scope),
+            "forward_solver": ("mip" if scfg.integer_enabled else "lp"),
+            "mip_fallback": int(n_fb),
             "n_paths": n_paths, "chunk_size": chunk, "T": T,
             "G": prob.G, "N_R": prob.N_R, "L": prob.L, "state_dim": Ly.dim,
             "lambda0": prob.lambda0, "dirichlet_s": prob.dirichlet_s,

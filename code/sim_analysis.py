@@ -17,7 +17,7 @@ TERMS = ("采购", "持有", "停机", "主动调拨", "被动调拨")
 CHECKS = ("pas", "fleet", "dem", "grade0", "grade", "N链接", "结构零",
           "F_new", "W守恒", "send_def", "tau_bal", "tau_lo", "tau_hi",
           "tau_src", "inv", "pipe", "pipe_last", "cap", "界.下", "界.上",
-          "链.状态")
+          "整数", "链.状态")
 
 # 状态流转的 round/repair 会轻微改动 n_out；这三项用 state_repair_tol 审计。
 STATE_NUMERIC_CHECKS = ("grade0", "grade", "W守恒")
@@ -62,7 +62,7 @@ def cost_terms(prob, Ly, x_in, rec) -> np.ndarray:
 
 
 def check_stage(prob, Ly, x, xo, q_out, taup, taum, S, y, scene_idx, ub,
-                F_new=None) -> dict:
+                F_new=None, integer_mode: bool = False) -> dict:
     """核对一期，返回 {核对项: 该期最大违约量}（≤ TOL 视为合规）。
 
     N 由 n_in + 场景 Θ 重算（与模型里的 N=Θn 链接等价）。F_new 可选：
@@ -136,6 +136,18 @@ def check_stage(prob, Ly, x, xo, q_out, taup, taum, S, y, scene_idx, ub,
         "界.下": float(np.maximum(-x, 0).max()),
         "界.上": float(np.maximum(x - ub, 0).max()),
     }
+    if integer_mode:
+        mask = Ly.logistics_integer_mask()
+        vals = [np.asarray(x, float)[mask], np.asarray(xo, float)[mask],
+                q_out, taup, taum, S, y]
+        dev = 0.0
+        for v in vals:
+            a = np.asarray(v, dtype=float).ravel()
+            if a.size:
+                dev = max(dev, float(np.max(np.abs(a - np.rint(a)))))
+        d["整数"] = dev
+    else:
+        d["整数"] = 0.0
     return d
 
 

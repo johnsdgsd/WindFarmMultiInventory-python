@@ -105,6 +105,12 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
     try:
         if resume_dir is not None:
             cuts, meta = load_cuts(d, prob.T, prob.state_dim)
+            m_int = bool(meta.get("integer_mode", False))
+            m_scope = str(meta.get("integer_scope", "none"))
+            if m_int != scfg.integer_enabled or m_scope != scfg.integer_scope:
+                raise SystemExit(
+                    f"割文件 integer_mode/scope={m_int}/{m_scope} 与当前 "
+                    f"{scfg.integer_enabled}/{scfg.integer_scope} 不一致，不能续训")
             eng.cuts = cuts
             eng.lb_best = float(meta.get("lb_best", 0.0))
             if eng.cut_selection == "lml1":
@@ -154,6 +160,10 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
             f"间隙 gap    : {gap:.4f} %",
             f"总成本 std  : {st.std:.6f}   最小 {st.lo:.4f}   最大 {st.hi:.4f}",
             f"割数        : {sum(len(c) for c in eng.cuts)}",
+            f"求解口径    : 前向 {'MIP' if scfg.integer_enabled else 'LP'}，"
+            f"后向 LP 松弛"
+            + (f"；integer_scope={scfg.integer_scope}" if scfg.integer_enabled else ""),
+            f"MIP 回退    : {sum(r.get('mip_fallback', 0) for r in hist)}",
             f"累计求解    : {eng.n_solves}",
             f"用时        : {time.time() - t0:.1f} s",
             "",

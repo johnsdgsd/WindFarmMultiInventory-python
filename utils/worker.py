@@ -33,7 +33,12 @@ def init_worker(prob, make_sub, cfg, T: int, initial_state, results_dir) -> None
     _W["cfg"] = cfg
     _W["T"] = int(T)
     _W["dim"] = int(prob.state_dim)
-    _W["x0"] = np.round(np.asarray(initial_state, dtype=float).ravel(), 6)
+    _W["integer"] = bool(getattr(cfg, "integer_enabled", False))
+    x0 = np.round(np.asarray(initial_state, dtype=float).ravel(), 6)
+    if _W["integer"]:
+        m = prob.layout.logistics_integer_mask()
+        x0[m] = np.rint(x0[m])
+    _W["x0"] = x0
     _W["results_dir"] = None if results_dir is None else Path(results_dir)
     _W["stage0"] = None
     _W["shared"] = None
@@ -86,6 +91,8 @@ def forward_path_task(task):
     """
     round_id, path_idx, scene_path, refs, record = task
     prob, T = _W["prob"], _W["T"]
+    int_mode = _W.get("integer", False)
+    fb0 = int(ce.MIP_FALLBACKS)
     x = _W["x0"].copy()
     states, costs = [], []
     records = [] if record else None
@@ -94,7 +101,7 @@ def forward_path_task(task):
             key = (round_id, t, "fwd")
             if t == 0:
                 sub = _stage0_sub(cuts_next, key)
-                sub.set_state(x)
+                sub.set_state(x, require_int=int_mode)
                 si = -1
             else:
                 # ⚠ 必须记**求解前**的 x：states[t-1] 是第 t 期的入库状态，后向要拿它
@@ -104,9 +111,9 @@ def forward_path_task(task):
                 states.append(x.copy())
                 sub = _shared_sub(t, cuts_next, key)
                 si = int(scene_path[t - 1])
-                sub.set_point(x, prob.pool[si])
+                sub.set_point(x, prob.pool[si], require_int=int_mode)
             try:
-                sub.solve_lp()
+                sub.solve_forward()
             except Exception as exc:
                 raise _fail("forward", t, si, sub, exc)
             x = sub.out_state_vector()
@@ -115,7 +122,7 @@ def forward_path_task(task):
                 if record:
                     records.append({**sub.decision_values(), "cost": costs[-1],
                                     "scene": si})
-    return states, costs, float(sum(costs)), records, 0
+    return states, costs, float(sum(costs)), records, int(ce.MIP_FALLBACKS) - fb0
 
 
 # ---------------------------------------------------------------- 后向任务
@@ -130,9 +137,10 @@ def backward_point_task(task):
     """
     round_id, t, trial_idx, x, scene_inds, ref = task
     prob, dim = _W["prob"], _W["dim"]
+    int_mode = bool(_W.get("integer", False))
     with pl.attached(ref) as cuts_next:
         sub = _shared_sub(t, cuts_next, (round_id, t, "bwd"))
-        sub.set_state(x)
+        sub.set_state(x, require_int=int_mode)
         grads = np.empty((len(scene_inds), dim))
         objs = np.empty(len(scene_inds))
         for k, si in enumerate(scene_inds):
@@ -152,7 +160,7 @@ def lower_bound_task(task):
     round_id, ref = task
     with pl.attached(ref) as cuts_next:
         sub = _stage0_sub(cuts_next, (round_id, 0, "lb"))
-        sub.set_state(_W["x0"])
+        sub.set_state(_W["x0"], require_int=bool(_W.get("integer", False)))
         try:
             sub.solve_lp()
         except Exception as exc:

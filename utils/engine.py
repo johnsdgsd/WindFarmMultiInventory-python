@@ -312,6 +312,9 @@ class SDDPEngine:
                 rec = {"iter": k, "lb": lb, "lb_best": self.lb_best,
                        "sim": sim, "time": elapsed,
                        "solves": self.n_solves, "mip_fallback": n_fb,
+                       "integer_mode": bool(getattr(self.cfg, "integer_enabled", False)),
+                       "forward_solver": ("mip" if getattr(self.cfg, "integer_enabled",
+                                                          False) else "lp"),
                        "n_cuts": sum(len(c) for c in self.cuts[1:]),
                        "n_dropped": self.n_cut_dropped}
                 history.append(rec)
@@ -352,6 +355,10 @@ class SDDPEngine:
                 "lambda0": getattr(self.prob, "lambda0", None),
                 "dirichlet_s": getattr(self.prob, "dirichlet_s", None),
                 "n_scenes": self.n_scenes,
+                "integer_mode": bool(getattr(self.cfg, "integer_enabled", False)),
+                "integer_scope": str(getattr(self.cfg, "integer_scope", "none")),
+                "forward_solver": ("mip" if getattr(self.cfg, "integer_enabled", False)
+                                   else "lp"),
                 "n_iterations": self.last_iter,
                 "n_cuts": sum(len(c) for c in self.cuts[1:]),
                 "n_solves": self.n_solves,
