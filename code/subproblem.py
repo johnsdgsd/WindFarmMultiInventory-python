@@ -103,6 +103,7 @@ class StageSubproblem:
         self._rows = {}
         self._obj = None
         self._last_mip = False
+        self._last_lift_info = None
         self._link_rows = {}
         self._tail_rows = {}
         self._row_sum_rows = {}
@@ -418,6 +419,90 @@ class StageSubproblem:
         self._obj = ce.solve(self.model, mip=False)
         self._last_mip = False
         return self
+
+    def solve_lb_mip(self) -> float:
+        """阶段 0 的整数主问题下界。
+
+        `auto_strict`：只有 MIP 证到最优（BestObj≈BestBnd）才读 BestObj；
+        否则读 BestBnd。两者都是最小化问题的合法下界，绝不把未证 incumbent
+        当 LB。
+        """
+        if not self.is_virtual:
+            raise RuntimeError("solve_lb_mip 只用于阶段 0")
+        info = ce.solve_bound(
+            self.model,
+            time_limit=float(getattr(self.cfg, "lb_time_limit", 60.0)),
+            rel_gap=float(getattr(self.cfg, "lb_rel_gap", 1e-9)),
+            abs_gap=float(getattr(self.cfg, "abs_gap", 1e-6)),
+            value="auto_strict", exact_tol=1e-9, return_info=True)
+        self._last_mip = True
+        b = None if info is None else info.get("value")
+        if b is None:
+            raise RuntimeError("阶段 0 MIP 没有返回合法下界")
+        return float(b)
+
+    def solve_lift(self, pi, *, time_limit: float, rel_gap: float,
+                   abs_gap: float = 0.0, safety_margin: float = 1e-6,
+                   value: str = "exact") -> float | None:
+        """固定 LP 斜率 pi 的 Lagrangian 整数截距（Strengthened Benders）。
+
+        解 min_{x_in free, integer} [f(z) - pi·x_in]；只临时释放 x_in 并
+        把 x_in 的目标系数从 c_s 改为 c_s-pi。
+
+        value="exact"：对标 SDDP.jl StrengthenedConicDuality，MIP 必须
+        BestObj≈BestBnd 才接受；否则返回 None，调用方回退 LP 割。
+        value="best_bnd"：超时也可用 BestBnd（合法但可能较弱），由调用方
+        与 LP 割取 max；仅用于训练提速/诊断。
+        """
+        if self.is_virtual:
+            raise RuntimeError("solve_lift 只用于真实阶段")
+        if self._state_vec is None or self._scene is None:
+            raise RuntimeError("solve_lift 前必须 set_state 和 set_scene")
+        if value not in ("exact", "best_bnd", "best_obj"):
+            raise ValueError(f"未知 lift value={value!r}")
+        pi = np.asarray(pi, dtype=float).ravel()
+        if pi.size != self.layout.dim:
+            raise ValueError(f"pi 维度 {pi.size} ≠ {self.layout.dim}")
+        m = self.model
+        xbar = np.asarray(self._state_vec, dtype=float).copy()
+        ub = np.asarray(self.layout.upper(self.prob_data), dtype=float)
+        cs = self.state_cost()
+        xin = self.x_in
+        # LP/MIP 当前解作为释放状态后 MIP 的显式可行起点。
+        all_vars = list(m.getVars())
+        all_vals = ce.values(m, all_vars)
+        info = None
+        try:
+            m.setInfo(COPT.Info.LB, xin, [0.0] * self.layout.dim)
+            m.setInfo(COPT.Info.UB, xin, [float(v) for v in ub])
+            m.setInfo(COPT.Info.Obj, xin,
+                      [float(cs[j] - pi[j]) for j in range(self.layout.dim)])
+            try:
+                m.setMipStart(all_vars, all_vals)
+            except Exception:
+                pass
+            # exact 口径必须关掉相对 gap；否则 objective_value 仍可能是 incumbent。
+            if value == "exact":
+                lg, ag = 0.0, 0.0
+            else:
+                lg, ag = float(rel_gap), float(abs_gap)
+            info = ce.solve_bound(
+                m, time_limit=float(time_limit), rel_gap=lg,
+                abs_gap=ag,
+                restore_rel_gap=float(getattr(self.cfg, "mip_rel_gap", 1e-3)),
+                restore_abs_gap=float(getattr(self.cfg, "abs_gap", 1e-6)),
+                value=str(value), exact_tol=1e-9, return_info=True)
+            self._last_mip = True
+        finally:
+            self._last_lift_info = info
+            m.setInfo(COPT.Info.LB, xin, [float(v) for v in xbar])
+            m.setInfo(COPT.Info.UB, xin, [float(v) for v in xbar])
+            m.setInfo(COPT.Info.Obj, xin,
+                      [float(v) for v in cs])
+        b = None if info is None else info.get("value")
+        if b is None:
+            return None
+        return float(b) - float(safety_margin)
 
     @property
     def obj(self) -> float:

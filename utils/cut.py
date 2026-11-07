@@ -30,8 +30,10 @@ class Cut:
     截距式与点式 θ ≥ obj + β·(x − x̄) 代数等价；取截距式是因为子问题的割约束直接
     写成 `theta >= alpha + Σ beta_j·xout_j`，不必再展开 state。
 
-    alpha : 截距，alpha = Q(x̄) - beta @ x̄（x̄ = state）
+    alpha : 截距，alpha = Q_cut(x̄) - beta @ x̄（x̄ = state）
     beta  : 次梯度 ∂Q/∂x，与状态向量同序、同维
+    obj   : 该割在锚点的取值 alpha + beta@state；标准 Benders 时等于 Q(x̄)，
+            开启 cut_lift 时是提升后的割值，不再等于原始 LP/整数目标。
     state : 生成该割的 backward 试验点（只作留痕：复现、剪枝、策略分析用）
     stage : 生成时所在的期（割近似的是 V_stage）
     obj   : Q(x̄)，逐场景期望目标值

@@ -27,6 +27,7 @@ from pathlib import Path
 import numpy as np
 
 from .cut import Cut, trivial_cut
+from .importance import Proposal, build_global_proposal, weight_stats
 from .io import TrainingLog, save_cuts
 from .payload import StagePayload, put_cuts
 from .worker import (backward_point_task, forward_path_task, init_worker,
@@ -65,6 +66,16 @@ class SDDPEngine:
 
         self.seed = int(cfg.seed)
         self.rng = np.random.default_rng(self.seed)
+        is_cfg = getattr(cfg, "importance_sampling", None)
+        self.is_enabled = bool(getattr(is_cfg, "enabled", False))
+        self.is_build_round = int(getattr(is_cfg, "build_after_round", 50))
+        self.is_uniform_floor = float(getattr(is_cfg, "uniform_floor", 0.05))
+        self.is_proposal = None
+        self.is_stats: dict = {}
+        self._is_paths: list[list[int]] = []
+        self._is_totals: list[float] = []
+        self._last_forward_weights = None
+        self._last_forward_scene_paths = None
         self.n_processes = int(cfg.n_processes)
         self.results_dir = None if results_dir is None else Path(results_dir)
         self.checkpoint_interval = float(cfg.checkpoint_interval)
@@ -83,6 +94,17 @@ class SDDPEngine:
 
         self.n_solves = 0
         self.n_cut_dropped = 0
+        self.n_lift_fallback = 0
+        self._prev_lb = None
+        self._prev_delta = None
+        self._lift_rounds = []
+        self._lift_gains = []
+        self._last_lift_gain = 0.0
+        cl = getattr(cfg, "cut_lift", None)
+        self._cl_mode = str(getattr(cl, "mode", "always"))
+        self._cl_scope = str(getattr(cl, "scope", "all"))
+        self._cl_threshold = float(getattr(cl, "lb_gain_threshold", 20.0))
+        self._cl_min_round = int(getattr(cl, "min_round", 50))
         self.lb_best = 0.0          # 历史最大合法 LB（LML1 删割时当前 LB 可能下降）
         self.round_id = 0
         self.last_iter = 0          # 最后一个完成的轮次（续训据此定起点）
@@ -129,6 +151,8 @@ class SDDPEngine:
 
     # ------------------------------------------------------------ 前向 pass
     def sample_scene_paths(self, n_paths: int) -> list[list[int]]:
+        if self.is_proposal is not None:
+            return self.is_proposal.sample_paths(self.rng, n_paths, self.T)
         return [self.rng.integers(0, self.n_scenes, size=self.T).tolist()
                 for _ in range(n_paths)]
 
@@ -137,10 +161,15 @@ class SDDPEngine:
 
         trial[t] = 第 t 期入库状态列表（即该阶段的全部试探点）；
         results[k] = (states, costs, total, records)。
+        IS 激活后，同时保存本批路径的似然比权重，供训练 UB 加权。
         """
         if n_paths < 1:
             raise ValueError("n_paths 至少为 1")
         scene_paths = self.sample_scene_paths(n_paths)
+        self._last_forward_scene_paths = scene_paths
+        self._last_forward_weights = (
+            self.is_proposal.weights(scene_paths)
+            if self.is_proposal is not None else None)
         results = self.forward_paths(scene_paths, record=record)
         trial = [[] for _ in range(self.T + 1)]
         for states, _, _, _, _ in results:
@@ -164,32 +193,45 @@ class SDDPEngine:
         return results
 
     # ------------------------------------------------------------ 后向 pass
-    def backward(self, trial, it: int) -> int:
+    def backward(self, trial, it: int, *, lift: bool = False) -> int:
         """按阶段串行（t = T..1），期内按试探点并行。返回新增割数。
 
         每个阶段：本阶段全部试探点的割算完，一起入库，再推进到 t−1 —— 这样期 t−1
         用到的 cuts[t] 已含本轮新割。
         """
         n_added = 0
+        self._last_lift_gain = 0.0
         for t in range(self.T, 0, -1):
             points = trial[t]
             if not points:
                 continue
+            stage_lift = bool(lift and (
+                self._cl_scope == "all"
+                or (self._cl_scope == "last" and t == self.T)))
             inds = self._sample_scenes(len(points))
             blk = put_cuts(self.cuts[t + 1] if t < self.T else [], self.state_dim)
             try:
                 tasks = [(self.round_id, t, i, np.asarray(x, dtype=float), inds[i],
-                          blk.ref) for i, x in enumerate(points)]
+                          blk.ref, stage_lift) for i, x in enumerate(points)]
                 results = self._map(backward_point_task, tasks)
             finally:
                 blk.close()
             self.n_solves += sum(len(s) for s in inds)
             new_cuts = []
-            for (_, _, _, x, _, _), (beta, obj) in zip(tasks, results):
+            gains = []
+            for (_, _, _, x, _, _, _), res in zip(tasks, results):
+                if stage_lift:
+                    beta, obj, fb, gain, _obj_lp = res
+                    self.n_lift_fallback += int(fb)
+                    gains.append(float(gain))
+                else:
+                    beta, obj = res
                 c = Cut(float(obj) - float(beta @ x), beta, x, t, float(obj), it)
                 self.cuts[t].append(c)
                 new_cuts.append(c)
                 n_added += 1
+            if stage_lift and gains:
+                self._last_lift_gain = float(np.mean(gains))
             if self.cut_selection == "lml1":
                 self._lml1_update(t, points, new_cuts)
         return n_added
@@ -304,26 +346,69 @@ class SDDPEngine:
                 if trace:
                     log(f"  [轮 {k}] 前向 {self.cfg.n_forward_paths} 条路径 …")
                 trial, results = self.forward(self.cfg.n_forward_paths)
-                sim = float(np.mean([r[2] for r in results]))
+                totals = [float(r[2]) for r in results]
+                w = self._last_forward_weights
+                sim = (float(np.mean([t * wi for t, wi in zip(totals, w)]))
+                       if w is not None else float(np.mean(totals)))
+                if self.is_enabled and self.is_proposal is None:
+                    sps = self._last_forward_scene_paths or []
+                    self._is_paths.extend([list(sp) for sp in sps])
+                    self._is_totals.extend(totals)
+                    if k >= self.is_build_round:
+                        self.is_proposal = build_global_proposal(
+                            self._is_paths, self._is_totals, self.n_scenes,
+                            self.is_uniform_floor)
+                        ws = self.is_proposal.weights(self._is_paths)
+                        self.is_stats = weight_stats(ws)
+                        self.is_stats["fingerprint"] = self.is_proposal.fingerprint
+                        self.is_stats["build_round"] = int(k)
+                        self.log(f"重要性采样：第 {k} 轮构建 proposal，"
+                                 f"ESS={self.is_stats['ess']:.1f}/"
+                                 f"{len(ws)}，权重 "
+                                 f"[{self.is_stats['min']:.2e}, "
+                                 f"{self.is_stats['max']:.2e}]")
+                        self._is_paths = []
+                        self._is_totals = []
                 n_fb = int(sum(r[4] for r in results))
+                lift_this = False
+                if getattr(self.cfg, "cut_lift_enabled", False):
+                    if self._cl_mode == "always":
+                        lift_this = True
+                    else:
+                        lift_this = (self._prev_delta is not None
+                                     and k >= self._cl_min_round
+                                     and self._prev_delta < self._cl_threshold)
                 if trace:
                     log(f"  [轮 {k}] 后向（{self.T} 期串行，每期 "
-                        f"{len(trial[1])} 个试探点）…")
-                self.backward(trial, it=k)
+                        f"{len(trial[1])} 个试探点）lift={lift_this} …")
+                self.backward(trial, it=k, lift=lift_this)
                 if trace:
                     log(f"  [轮 {k}] 下界 …")
                 lb = self.lower_bound()
+                delta_lb = (lb - self._prev_lb
+                            if self._prev_lb is not None else None)
+                if lift_this:
+                    self._lift_rounds.append(int(k))
+                    self._lift_gains.append(float(self._last_lift_gain))
+                self._prev_lb = lb
+                self._prev_delta = delta_lb
                 self.last_iter = k
                 elapsed = time.time() - t0
                 rec = {"iter": k, "lb": lb, "lb_best": self.lb_best,
                        "sim": sim, "time": elapsed,
                        "solves": self.n_solves, "mip_fallback": n_fb,
+                       "delta_lb": delta_lb,
+                       "lift_used": bool(lift_this),
+                       "lift_gain": float(self._last_lift_gain),
+                       "lift_fallback": int(self.n_lift_fallback),
                        "integer_mode": bool(getattr(self.cfg, "integer_enabled", False)),
                        "integer_scope": str(getattr(self.cfg, "integer_scope", "none")),
                        "integer_rounding": str(getattr(self.cfg, "integer_rounding",
                                                        "none")),
                        "forward_solver": ("mip" if getattr(self.cfg, "integer_enabled",
                                                           False) else "lp"),
+                       "is_active": self.is_proposal is not None,
+                       "is_ess": float(self.is_stats.get("ess", 0.0)),
                        "n_cuts": sum(len(c) for c in self.cuts[1:]),
                        "n_dropped": self.n_cut_dropped}
                 history.append(rec)
@@ -370,10 +455,44 @@ class SDDPEngine:
                 "n0_mode": str(getattr(self.prob, "n0_mode", "continuous")),
                 "forward_solver": ("mip" if getattr(self.cfg, "integer_enabled", False)
                                    else "lp"),
+                "lower_bound_solver": ("mip" if getattr(self.cfg, "integer_enabled",
+                                                         False) else "lp"),
+                "importance_sampling": {
+                    "enabled": self.is_enabled,
+                    "active": self.is_proposal is not None,
+                    "build_after_round": self.is_build_round,
+                    "uniform_floor": self.is_uniform_floor,
+                    "proposal_fingerprint": (
+                        None if self.is_proposal is None
+                        else self.is_proposal.fingerprint),
+                    "proposal_g": (None if self.is_proposal is None
+                                   else self.is_proposal.g.tolist()),
+                    "stats": self.is_stats,
+                },
+                "cut_lift": {
+                    "enabled": bool(getattr(self.cfg, "cut_lift_enabled", False)),
+                    "scope": str(getattr(self.cfg.cut_lift, "scope", "all")),
+                    "mode": self._cl_mode,
+                    "value": str(getattr(self.cfg.cut_lift, "value", "exact")),
+                    "lb_gain_threshold": self._cl_threshold,
+                    "min_round": self._cl_min_round,
+                    "n_fallback": self.n_lift_fallback,
+                    "lift_rounds": list(self._lift_rounds),
+                    "lift_gains": list(self._lift_gains),
+                },
                 "n_iterations": self.last_iter,
                 "n_cuts": sum(len(c) for c in self.cuts[1:]),
                 "n_solves": self.n_solves,
                 "lb_best": self.lb_best}
+
+    def restore_importance(self, meta: dict) -> None:
+        """resume 时从 cuts meta 恢复已固定的 proposal。"""
+        ism = (meta or {}).get("importance_sampling") or {}
+        g = ism.get("proposal_g")
+        if g:
+            self.is_proposal = Proposal(np.asarray(g, dtype=float))
+            self.is_stats = dict(ism.get("stats") or {})
+            self.is_stats["fingerprint"] = self.is_proposal.fingerprint
 
     def open_log(self, name: str = "sddp_training_log.csv") -> TrainingLog:
         if self.results_dir is None:

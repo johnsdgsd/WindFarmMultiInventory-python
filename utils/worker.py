@@ -34,6 +34,8 @@ def init_worker(prob, make_sub, cfg, T: int, initial_state, results_dir) -> None
     _W["T"] = int(T)
     _W["dim"] = int(prob.state_dim)
     _W["integer"] = bool(getattr(cfg, "integer_enabled", False))
+    _W["cut_lift"] = bool(getattr(cfg, "cut_lift_enabled", False))
+    _W["cut_lift_cfg"] = getattr(cfg, "cut_lift", None)
     x0 = np.round(np.asarray(initial_state, dtype=float).ravel(), 6)
     if _W["integer"]:
         m = prob.layout.integer_mask(str(getattr(cfg, "integer_scope", "none")))
@@ -135,33 +137,76 @@ def backward_point_task(task):
     **一任务 = 一个试探点 = 一条割**（用户要求的最小产出单位）。返回 (beta, obj)，
     截距 alpha = obj − beta@x 由主管程算（x 只有主管程有）。
     """
-    round_id, t, trial_idx, x, scene_inds, ref = task
+    if len(task) >= 7:
+        round_id, t, trial_idx, x, scene_inds, ref = task[:6]
+        lift_flag = bool(task[6])
+    else:
+        round_id, t, trial_idx, x, scene_inds, ref = task
+        lift_flag = True
     prob, dim = _W["prob"], _W["dim"]
     int_mode = bool(_W.get("integer", False))
+    lift = bool(lift_flag and _W.get("cut_lift", False))
+    lcfg = _W.get("cut_lift_cfg")
+    lift_value = str(getattr(lcfg, "value", "exact"))
     with pl.attached(ref) as cuts_next:
         sub = _shared_sub(t, cuts_next, (round_id, t, "bwd"))
         sub.set_state(x, require_int=int_mode)
         grads = np.empty((len(scene_inds), dim))
-        objs = np.empty(len(scene_inds))
+        vals = np.empty(len(scene_inds))
+        lp_objs = np.empty(len(scene_inds))
+        n_fb = 0
         for k, si in enumerate(scene_inds):
             sub.set_scene(prob.pool[si])
             try:
                 sub.solve_lp()
             except Exception as exc:
                 raise _fail("backward", t, si, sub, exc)
-            grads[k] = sub.gradient("dj")
-            objs[k] = sub.obj
-    return grads.mean(axis=0), float(objs.mean())
+            beta = np.asarray(sub.gradient("dj"), float)
+            lp_obj = float(sub.obj)
+            grads[k] = beta
+            lp_objs[k] = lp_obj
+            if lift:
+                # 先解固定状态整数子问题，用其整数解作为释放状态 lift MIP 的起点。
+                # 这只是热启动；是否接受 lift 值由 solve_lift 的 exact 口径决定。
+                try:
+                    sub.solve_mip()
+                except Exception:
+                    pass
+                nu = sub.solve_lift(
+                    beta, time_limit=float(lcfg.time_limit),
+                    rel_gap=float(lcfg.rel_gap),
+                    abs_gap=float(lcfg.abs_gap),
+                    safety_margin=float(lcfg.safety_margin),
+                    value=lift_value)
+                if nu is None:
+                    nu = lp_obj - float(beta @ x)
+                    n_fb += 1
+            else:
+                nu = lp_obj - float(beta @ x)
+            vals[k] = nu
+        beta_mean = grads.mean(axis=0)
+        obj_lift = float(np.mean(vals + grads @ x))
+        if lift:
+            # 同一 beta 下，LP 割（obj_lp）与提升割都是合法下界；取 max 保证
+            # BestBnd 未解透时不会用一个比标准割更弱的割。
+            obj_lp = float(np.mean(lp_objs))
+            obj_used = max(obj_lift, obj_lp)
+            gain = float(obj_used - obj_lp)
+            return beta_mean, obj_used, n_fb, gain, obj_lp
+        return beta_mean, obj_lift
 
 
 # ---------------------------------------------------------------- 下界任务
 def lower_bound_task(task):
     """阶段 0 子问题解 LP。割只增不减 ⇒ 下界单调不减，且不依赖随机数。"""
     round_id, ref = task
+    int_mode = bool(_W.get("integer", False))
     with pl.attached(ref) as cuts_next:
         sub = _stage0_sub(cuts_next, (round_id, 0, "lb"))
-        sub.set_state(_W["x0"], require_int=bool(_W.get("integer", False)))
+        sub.set_state(_W["x0"], require_int=int_mode)
         try:
+            if int_mode:
+                return sub.solve_lb_mip()
             sub.solve_lp()
         except Exception as exc:
             raise _fail("lower_bound", 0, -1, sub, exc)

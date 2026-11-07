@@ -257,6 +257,90 @@ class IntegerConfig:
 
 
 @dataclass
+class ImportanceSamplingConfig:
+    """训练前向的重要性采样：默认关闭；仿真始终均匀 MC。"""
+
+    enabled: bool = False
+    target: str = "training"
+    build_after_round: int = 50
+    uniform_floor: float = 0.05
+
+    def __post_init__(self) -> None:
+        if self.target != "training":
+            raise ValueError(
+                f"[importance_sampling] target 只能是 training，实际 {self.target!r}")
+        if self.build_after_round < 1:
+            raise ValueError(
+                "[importance_sampling] build_after_round 必须 ≥ 1，"
+                f"实际 {self.build_after_round}")
+        if not (0.0 < float(self.uniform_floor) < 1.0):
+            raise ValueError(
+                "[importance_sampling] uniform_floor 必须在 (0,1)，"
+                f"实际 {self.uniform_floor}")
+
+    def describe(self) -> str:
+        if not self.enabled:
+            return "off"
+        return (f"on  target={self.target}  build_after_round="
+                f"{self.build_after_round}  uniform_floor={self.uniform_floor:g}")
+
+
+@dataclass
+class CutLiftConfig:
+    """后向割的 Strengthened Benders 截距提升；默认关闭。
+
+    value="exact" 对标 SDDP.jl StrengthenedConicDuality：MIP 必须
+    BestObj≈BestBnd 才接受，否则回退 LP 割。value="best_bnd" 只用于
+    训练提速/诊断，超时值由 worker 与 LP 割取 max。
+    """
+
+    enabled: bool = False
+    scope: str = "all"
+    mode: str = "always"
+    value: str = "exact"
+    time_limit: float = 5.0
+    rel_gap: float = 0.0
+    abs_gap: float = 0.0
+    safety_margin: float = 1e-6
+    lb_gain_threshold: float = 20.0
+    min_round: int = 50
+
+    def __post_init__(self) -> None:
+        if self.scope not in ("all", "last"):
+            raise ValueError(
+                f"[cut_lift] scope 只能是 all/last，实际 {self.scope!r}")
+        if self.mode not in ("always", "stagnation"):
+            raise ValueError(f"[cut_lift] mode 只能是 always/stagnation，实际 {self.mode!r}")
+        if self.value not in ("exact", "best_bnd"):
+            raise ValueError(
+                f"[cut_lift] value 只能是 exact/best_bnd，实际 {self.value!r}"
+                "（best_obj 是未证 incumbent，已禁用）")
+        if float(self.time_limit) <= 0:
+            raise ValueError("[cut_lift] time_limit 必须为正")
+        if float(self.rel_gap) < 0 or float(self.abs_gap) < 0:
+            raise ValueError("[cut_lift] rel_gap/abs_gap 不得为负")
+        if self.value == "exact" and (float(self.rel_gap) != 0.0
+                                      or float(self.abs_gap) != 0.0):
+            raise ValueError(
+                "[cut_lift] value=exact 要求 rel_gap=0 且 abs_gap=0；"
+                "要限时用 best_bnd")
+        if float(self.safety_margin) < 0:
+            raise ValueError("[cut_lift] safety_margin 不得为负")
+        if float(self.lb_gain_threshold) < 0:
+            raise ValueError("[cut_lift] lb_gain_threshold 不得为负")
+        if int(self.min_round) < 0:
+            raise ValueError("[cut_lift] min_round 不得为负")
+
+    def describe(self) -> str:
+        if not self.enabled:
+            return "off"
+        return (f"on  scope={self.scope}  mode={self.mode}  value={self.value}  "
+                f"time_limit={self.time_limit:g}s  rel_gap={self.rel_gap:g}"
+                + (f"  threshold={self.lb_gain_threshold:g}  min_round={self.min_round}"
+                   if self.mode == "stagnation" else ""))
+
+
+@dataclass
 class SolverConfig:
     # 训练
     iterations: int
@@ -269,6 +353,8 @@ class SolverConfig:
     cut_select_eps: float
     cut_select_keep_rounds: int
     integer: IntegerConfig
+    importance_sampling: ImportanceSamplingConfig
+    cut_lift: CutLiftConfig
     # 并行
     n_processes: int
     threads_per_process: int
@@ -282,6 +368,8 @@ class SolverConfig:
     presolve: int
     mip_rel_gap: float
     mip_time_limit: float
+    lb_rel_gap: float
+    lb_time_limit: float
     # 输出
     tag: str
     results_root: str
@@ -316,6 +404,14 @@ class SolverConfig:
     def integer_rounding(self) -> str:
         return str(self.integer.rounding)
 
+    @property
+    def importance_enabled(self) -> bool:
+        return bool(self.importance_sampling.enabled)
+
+    @property
+    def cut_lift_enabled(self) -> bool:
+        return bool(self.cut_lift.enabled)
+
     def __post_init__(self) -> None:
         if self.iterations < 0:
             raise ValueError(f"[training] iterations 不得为负，实际 {self.iterations}")
@@ -347,6 +443,12 @@ class SolverConfig:
         if self.mip_time_limit <= 0:
             raise ValueError(f"[numerics] mip_time_limit 必须为正，"
                              f"实际 {self.mip_time_limit}")
+        if self.lb_rel_gap < 0:
+            raise ValueError(f"[numerics] lb_rel_gap 不得为负，"
+                             f"实际 {self.lb_rel_gap}")
+        if self.lb_time_limit <= 0:
+            raise ValueError(f"[numerics] lb_time_limit 必须为正，"
+                             f"实际 {self.lb_time_limit}")
 
     def describe(self) -> str:
         return "\n".join([
@@ -355,11 +457,14 @@ class SolverConfig:
             f"  后向场景 {self.n_backward_samples or '全枚举'}"
             f"  割筛选 {self.cut_selection}"
             f"  整数 {self.integer.describe()}"
+            f"  重要性采样 {self.importance_sampling.describe()}"
+            f"  割提升 {self.cut_lift.describe()}"
             f"  时限 {self.max_train_seconds or '不限'} s",
             f"并行   进程 {self.n_processes}  每进程 COPT 线程 {self.threads_per_process}",
             f"仿真   路径 {self.n_simulations}  块大小 {self.chunk_size}",
             f"数值   FeasTol {self.feas_tol:g}  DualTol {self.dual_tol:g}  "
-            f"IntTol {self.int_tol:g}  Presolve {self.presolve}",
+            f"IntTol {self.int_tol:g}  Presolve {self.presolve}"
+            f"  LB MIP gap {self.lb_rel_gap:g} / {self.lb_time_limit:g}s",
             f"输出   {self.results_root}/{self.tag}_<时间戳>",
         ])
 
@@ -389,6 +494,43 @@ def load_solver_config(path, *, resolve: bool = True) -> SolverConfig:
             scope=scope,
             rounding=rounding,
         )
+    is_raw = raw.get("importance_sampling")
+    if is_raw is None:
+        importance = ImportanceSamplingConfig()
+    else:
+        if not isinstance(is_raw, dict):
+            raise TypeError(f"配置 {path.name} 的 [importance_sampling] 必须是表")
+        importance = ImportanceSamplingConfig(
+            enabled=bool(_req(is_raw, "enabled",
+                              "solver.toml/importance_sampling")),
+            target=str(_req(is_raw, "target",
+                            "solver.toml/importance_sampling")),
+            build_after_round=int(_req(is_raw, "build_after_round",
+                                       "solver.toml/importance_sampling")),
+            uniform_floor=float(_req(is_raw, "uniform_floor",
+                                     "solver.toml/importance_sampling")),
+        )
+    cl_raw = raw.get("cut_lift")
+    if cl_raw is None:
+        cut_lift = CutLiftConfig()
+    else:
+        if not isinstance(cl_raw, dict):
+            raise TypeError(f"配置 {path.name} 的 [cut_lift] 必须是表")
+        cut_lift = CutLiftConfig(
+            enabled=bool(_req(cl_raw, "enabled", "solver.toml/cut_lift")),
+            scope=str(_req(cl_raw, "scope", "solver.toml/cut_lift")),
+            mode=str(_opt(cl_raw, "mode", "always", "solver.toml/cut_lift")),
+            value=str(_opt(cl_raw, "value", "exact", "solver.toml/cut_lift")),
+            time_limit=float(_req(cl_raw, "time_limit", "solver.toml/cut_lift")),
+            rel_gap=float(_req(cl_raw, "rel_gap", "solver.toml/cut_lift")),
+            abs_gap=float(_opt(cl_raw, "abs_gap", 0.0, "solver.toml/cut_lift")),
+            safety_margin=float(_opt(cl_raw, "safety_margin", 1e-6,
+                                     "solver.toml/cut_lift")),
+            lb_gain_threshold=float(_opt(cl_raw, "lb_gain_threshold", 20.0,
+                                         "solver.toml/cut_lift")),
+            min_round=int(_opt(cl_raw, "min_round", 50,
+                               "solver.toml/cut_lift")),
+        )
     cfg = SolverConfig(
         iterations=int(_req(tr, "iterations", "solver.toml/training")),
         forward_paths_per_process=int(
@@ -402,6 +544,8 @@ def load_solver_config(path, *, resolve: bool = True) -> SolverConfig:
         cut_select_eps=float(_req(tr, "cut_select_eps", "solver.toml/training")),
         cut_select_keep_rounds=int(_req(tr, "cut_select_keep_rounds", "solver.toml/training")),
         integer=integer,
+        importance_sampling=importance,
+        cut_lift=cut_lift,
         n_processes=int(_req(pa, "n_processes", "solver.toml/parallel")),
         threads_per_process=int(_req(pa, "threads_per_process", "solver.toml/parallel")),
         n_simulations=int(_req(si, "n_simulations", "solver.toml/simulation")),
@@ -412,6 +556,9 @@ def load_solver_config(path, *, resolve: bool = True) -> SolverConfig:
         presolve=int(_req(nu, "presolve", "solver.toml/numerics")),
         mip_rel_gap=float(_req(nu, "mip_rel_gap", "solver.toml/numerics")),
         mip_time_limit=float(_req(nu, "mip_time_limit", "solver.toml/numerics")),
+        lb_rel_gap=float(_opt(nu, "lb_rel_gap", 1e-9, "solver.toml/numerics")),
+        lb_time_limit=float(_opt(nu, "lb_time_limit", 60.0,
+                                 "solver.toml/numerics")),
         tag=str(_req(ou, "tag", "solver.toml/output")),
         results_root=str(_req(ou, "results_root", "solver.toml/output")),
         source_path=path,

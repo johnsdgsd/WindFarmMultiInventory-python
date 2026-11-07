@@ -49,6 +49,8 @@ presolve = -1             # -1 自动；0 关；1 少量快；2 正常；3 多�
 # RSS 1.8 GB）。放宽 gap + 设时限后同一处瞬时返回。割仍来自后向 LP，始终是合法下界。
 mip_rel_gap = 0.001       # MIP 相对 gap 容忍（0.1%）
 mip_time_limit = 5.0     # 单次 MIP 时限（秒）；到时限但有可行解就采用
+lb_rel_gap = 1e-9
+lb_time_limit = 60.0
 
 [output]
 tag = "int_t2_pilot_lp"              # 结果目录前缀：results/<tag>_<时间戳>/

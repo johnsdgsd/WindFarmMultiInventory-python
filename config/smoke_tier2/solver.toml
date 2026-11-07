@@ -31,6 +31,8 @@ int_tol = 1e-6
 presolve = -1
 mip_rel_gap = 0.001       # 前向 MIP 相对 gap 容忍（见 config/solver.toml 说明）
 mip_time_limit = 20.0     # 单次 MIP 时限（秒）
+lb_rel_gap = 1e-9
+lb_time_limit = 60.0
 
 [output]
 tag = "smoke_tier2"

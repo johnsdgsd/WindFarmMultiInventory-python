@@ -133,6 +133,8 @@ def main(dir_arg: str, n_paths: int, chunk_size: int | None):
     print(f"结果目录 {d.name}")
     print(f"仿真 {n_paths} 条路径，块大小 {chunk}，种子 {scfg.seed}，"
           f"T={T} G={prob.G} N_R={prob.N_R}")
+    if scfg.importance_enabled:
+        print("[提示] 仿真使用均匀 MC；训练前向的 IS 不作用于最终 UB。")
 
     eng = SDDPEngine(prob, make_stage_subproblem, scfg, results_dir=d,
                      log=lambda *a, **k: None)
@@ -147,13 +149,17 @@ def main(dir_arg: str, n_paths: int, chunk_size: int | None):
         m_scope = str(meta_cuts.get("integer_scope", "none"))
         m_round = str(meta_cuts.get("integer_rounding", "none"))
         m_n0 = str(meta_cuts.get("n0_mode", "continuous"))
+        m_cl = meta_cuts.get("cut_lift") or {}
+        cl_ok = (bool(m_cl.get("enabled", False)) == scfg.cut_lift_enabled)
         if (m_int != scfg.integer_enabled or m_scope != scfg.integer_scope
                 or m_round != scfg.integer_rounding
-                or m_n0 != prob.n0_mode):
+                or m_n0 != prob.n0_mode or not cl_ok):
             raise SystemExit(
-                f"割文件 mode/scope/rounding/n0={m_int}/{m_scope}/{m_round}/{m_n0} "
-                f"与配置 {scfg.integer_enabled}/{scfg.integer_scope}/"
-                f"{scfg.integer_rounding}/{prob.n0_mode} 不一致")
+                f"割文件 mode/scope/rounding/n0/cl={m_int}/{m_scope}/"
+                f"{m_round}/{m_n0}/{m_cl} 与配置 "
+                f"{scfg.integer_enabled}/{scfg.integer_scope}/"
+                f"{scfg.integer_rounding}/{prob.n0_mode}/"
+                f"{scfg.cut_lift_enabled} 不一致")
         eng.cuts = cuts
         lb = eng.lower_bound()
         done, blk = 0, 0
@@ -202,6 +208,9 @@ def main(dir_arg: str, n_paths: int, chunk_size: int | None):
             "integer_rounding": str(scfg.integer_rounding),
             "n0_mode": str(prob.n0_mode),
             "forward_solver": ("mip" if scfg.integer_enabled else "lp"),
+            "importance_sampling_used": False,
+            "cut_lift_used": str(meta_cuts.get("cut_lift", {}).get("enabled",
+                                                                   False)),
             "mip_fallback": int(n_fb),
             "n_paths": n_paths, "chunk_size": chunk, "T": T,
             "G": prob.G, "N_R": prob.N_R, "L": prob.L, "state_dim": Ly.dim,

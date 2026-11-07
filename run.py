@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import csv
 import os
 import sys
 import time
@@ -109,16 +110,29 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
             m_scope = str(meta.get("integer_scope", "none"))
             m_round = str(meta.get("integer_rounding", "none"))
             m_n0 = str(meta.get("n0_mode", "continuous"))
+            m_is = meta.get("importance_sampling") or {}
+            m_cl = meta.get("cut_lift") or {}
+            is_ok = (bool(m_is.get("enabled", False))
+                     == scfg.importance_enabled)
+            if is_ok and scfg.importance_enabled:
+                is_ok = (int(m_is.get("build_after_round", -1))
+                         == scfg.importance_sampling.build_after_round
+                         and float(m_is.get("uniform_floor", -1))
+                         == scfg.importance_sampling.uniform_floor)
+            cl_ok = (bool(m_cl.get("enabled", False))
+                     == scfg.cut_lift_enabled)
+            if cl_ok and scfg.cut_lift_enabled:
+                cl_ok = (str(m_cl.get("value", "exact"))
+                         == scfg.cut_lift.value)
             if (m_int != scfg.integer_enabled or m_scope != scfg.integer_scope
                     or m_round != scfg.integer_rounding
-                    or m_n0 != prob.n0_mode):
+                    or m_n0 != prob.n0_mode or not is_ok or not cl_ok):
                 raise SystemExit(
-                    f"割文件 mode/scope/rounding/n0={m_int}/{m_scope}/"
-                    f"{m_round}/{m_n0} 与当前 {scfg.integer_enabled}/"
-                    f"{scfg.integer_scope}/{scfg.integer_rounding}/"
-                    f"{prob.n0_mode} 不一致，不能续训")
+                    f"割文件 mode/scope/rounding/n0/is/cl={m_int}/{m_scope}/"
+                    f"{m_round}/{m_n0}/{m_is}/{m_cl} 与当前配置不一致，不能续训")
             eng.cuts = cuts
             eng.lb_best = float(meta.get("lb_best", 0.0))
+            eng.restore_importance(meta)
             if eng.cut_selection == "lml1":
                 n_hist = eng.restore_cut_history()
                 print(f"LML1 历史已从割的 state 重建：{n_hist} 条记录")
@@ -129,6 +143,11 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
             write_configs(d, cdir / "problem.toml", cdir / "solver.toml")
 
         log = eng.open_log()
+        lift_log = (d / "cut_lift_log.csv").open("w", newline="",
+                                                  encoding="utf-8")
+        lift_writer = csv.writer(lift_log)
+        lift_writer.writerow(["iter", "time_s", "lb", "delta_lb",
+                              "lift_used", "lift_gain", "lift_fallback"])
 
         def on_iter(rec):
             log.row(rec["iter"], rec["sim"], rec["lb"], rec["time"], rec["solves"])
@@ -137,6 +156,16 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
             nd = rec.get("n_dropped", 0)
             if nd:
                 note += f" | 已筛除 {nd}"
+            lift_writer.writerow([
+                rec["iter"], f"{rec['time']:.3f}", f"{rec['lb']:.6f}",
+                "" if rec.get("delta_lb") is None else f"{rec['delta_lb']:.6f}",
+                int(rec.get("lift_used", False)),
+                f"{rec.get('lift_gain', 0.0):.6e}",
+                int(rec.get("lift_fallback", 0)),
+            ])
+            lift_log.flush()
+            if rec.get("lift_used"):
+                note += f" | LIFT gain={rec.get('lift_gain', 0.0):.3e}"
             print(f"  轮 {rec['iter']:5d} | LB = {rec['lb']:14.4f} | "
                   f"前向均值 = {rec['sim']:14.4f} | 割数 = {rec['n_cuts']:6d} | "
                   f"{rec['time']:7.1f} s{note}")
@@ -145,6 +174,7 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
         hist = eng.train(scfg.iterations, start_iter=start_iter, verbose=False,
                          trace=bool(os.environ.get("SDDP_TRACE")))
         log.close()
+        lift_log.close()
 
         lb = eng.lower_bound()
         print(f"训练完成：{len(hist)} 轮，用时 {time.time() - t0:.1f} s，"
@@ -162,8 +192,12 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
                 + (f"；integer_scope={scfg.integer_scope}"
                    f"；rounding={scfg.integer_rounding}"
                    f"；n0_mode={prob.n0_mode}"
-                   if scfg.integer_scope != "none" else ""),
+                   if scfg.integer_scope != "none" else "")
+                + f"；LB {'MIP' if scfg.integer_enabled else 'LP'}"
+                + f"；IS={scfg.importance_sampling.describe()}"
+                + f"；cut_lift={scfg.cut_lift.describe()}",
                 f"MIP 回退    : {sum(r.get('mip_fallback', 0) for r in hist)}",
+                f"割提升回退  : {eng.n_lift_fallback}",
                 f"累计求解    : {eng.n_solves}",
                 f"训练用时    : {time.time() - t0:.1f} s",
                 "",
@@ -177,6 +211,8 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
             print(f"已保存：{d}")
             return d
 
+        if scfg.importance_enabled:
+            print("[提示] 内置仿真使用均匀 MC，忽略训练前向 IS。")
         print(f"仿真 {scfg.n_simulations} 条路径（chunk = {scfg.chunk_size}）…")
         st = simulate(eng, n_paths=scfg.n_simulations, seed=scfg.seed,
                       chunk_size=scfg.chunk_size)
@@ -198,8 +234,12 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
             + (f"；integer_scope={scfg.integer_scope}"
                f"；rounding={scfg.integer_rounding}"
                f"；n0_mode={prob.n0_mode}"
-               if scfg.integer_scope != "none" else ""),
+               if scfg.integer_scope != "none" else "")
+            + f"；LB {'MIP' if scfg.integer_enabled else 'LP'}"
+            + f"；IS={scfg.importance_sampling.describe()}"
+            + f"；cut_lift={scfg.cut_lift.describe()}",
             f"MIP 回退    : {sum(r.get('mip_fallback', 0) for r in hist)}",
+            f"割提升回退  : {eng.n_lift_fallback}",
             f"累计求解    : {eng.n_solves}",
             f"用时        : {time.time() - t0:.1f} s",
             "",

@@ -21,6 +21,7 @@ import tempfile
 from pathlib import Path
 
 import coptpy as cp
+import numpy as np
 from coptpy import COPT
 
 
@@ -131,6 +132,80 @@ def check_optimal(m: "cp.Model", *, mip: bool) -> None:
         raise SolverError(f"{kind} 求解未达最优：status={m.status}"
                           f"（OPTIMAL={COPT.OPTIMAL} INFEASIBLE={COPT.INFEASIBLE} "
                           f"UNBOUNDED={COPT.UNBOUNDED}）")
+
+
+def solve_bound(m: "cp.Model", *, time_limit: float, rel_gap: float,
+                abs_gap: float = 0.0,
+                restore_rel_gap: float = 1e-3,
+                restore_abs_gap: float = 1e-6,
+                value: str = "best_bnd",
+                exact_tol: float = 1e-7,
+                return_info: bool = False):
+    """解一个 MIP，按 value 选择一个可信的返回值。
+
+    value:
+      · "exact"       仅当 status=OPTIMAL 且 BestObj≈BestBnd 时返回 BestObj，
+                      否则 None。对标 SDDP.jl StrengthenedConicDuality：
+                      MIP 没证到最优就回退 LP 割，绝不拿 incumbent 凑数。
+      · "auto_strict" 已证最优返回 BestObj，否则返回 BestBnd（合法但可能较弱）。
+                      下界用它：BestBnd 是证明过的 MIP 下界。
+      · "best_bnd"    BestBnd，超时也使用（合法下界）。
+      · "auto"        兼容旧调用：OPTIMAL 时 BestObj，否则 BestBnd。
+      · "best_obj"    incumbent（仅诊断；不保证合法下界）。
+
+    `return_info=True` 时返回诊断 dict（value/status/BestObj/BestBnd/...），
+    否则只返回 value。
+    """
+    if value not in ("exact", "auto_strict", "best_bnd", "auto", "best_obj"):
+        raise ValueError(f"未知 MIP value={value!r}")
+    info = {"value": None, "status": None, "has_mip_sol": None,
+            "best_obj": None, "best_bnd": None, "best_gap": None,
+            "exact_ok": False, "elapsed": 0.0}
+    t0 = time.time()
+    m.setParam(COPT.Param.TimeLimit, float(time_limit))
+    m.setParam(COPT.Param.RelGap, float(rel_gap))
+    m.setParam(COPT.Param.AbsGap, float(abs_gap))
+    try:
+        try:
+            m.solve()
+        except Exception:
+            return info if return_info else None
+        status = int(m.status)
+        info["status"] = status
+        if status == COPT.INFEASIBLE or status == COPT.UNBOUNDED:
+            return info if return_info else None
+        try:
+            has = int(m.getAttr(COPT.Attr.HasMipSol))
+            bnd = float(m.getAttr(COPT.Attr.BestBnd))
+            obj = float(m.getAttr(COPT.Attr.BestObj))
+            gap = float(m.getAttr(COPT.Attr.BestGap))
+        except Exception:
+            return info if return_info else None
+        info.update({"has_mip_sol": has, "best_obj": obj,
+                     "best_bnd": bnd, "best_gap": gap})
+        scale = max(1.0, abs(obj), abs(bnd))
+        exact_ok = (status == COPT.OPTIMAL and has == 1
+                    and np.isfinite(obj) and np.isfinite(bnd)
+                    and abs(obj - bnd) <= float(exact_tol) * scale)
+        info["exact_ok"] = bool(exact_ok)
+        if value == "exact":
+            b = obj if exact_ok else None
+        elif value == "auto_strict":
+            b = obj if exact_ok else (bnd if np.isfinite(bnd) else None)
+        elif value == "best_obj":
+            b = obj if has == 1 and np.isfinite(obj) else None
+        elif value == "auto":
+            b = obj if status == COPT.OPTIMAL else bnd
+            b = b if np.isfinite(b) else None
+        else:
+            b = bnd if np.isfinite(bnd) else None
+        info["value"] = b
+        return info if return_info else b
+    finally:
+        info["elapsed"] = time.time() - t0
+        m.setParam(COPT.Param.TimeLimit, 1e20)
+        m.setParam(COPT.Param.RelGap, float(restore_rel_gap))
+        m.setParam(COPT.Param.AbsGap, float(restore_abs_gap))
 
 
 def values(m: "cp.Model", var) -> list:
