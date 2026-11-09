@@ -1,0 +1,88 @@
+# _t_async_tier2.py — Tier2 全整数异步 iteration 引擎 2h runner。
+# 前向 solve_mip，后向 solve_lp，Julia 式割池；训练后另跑 simulate.py。
+from __future__ import annotations
+
+import argparse
+import shutil
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+sys.stdout.reconfigure(errors="replace")
+
+from code.config import load_problem_config, load_solver_config  # noqa: E402
+from code.problem_data import DefineProblem, print_summary, to_json  # noqa: E402
+from code.subproblem import make_stage_subproblem                # noqa: E402
+from utils.async_engine import AsyncIterationEngine              # noqa: E402
+from utils.io import (TrainingLog, new_run_dir, save_cuts,        # noqa: E402
+                      save_json, save_summary, write_configs)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--seconds", type=float, default=7200.0)
+    ap.add_argument("--iters", type=int, default=100000)
+    ap.add_argument("--workers", type=int, default=10)
+    ap.add_argument("--cut-selection", default="julia")
+    ap.add_argument("--config-dir",
+                    default=str(ROOT / "test" / "_cfg_tier2_cutpool_2h"))
+    args = ap.parse_args()
+
+    cdir = Path(args.config_dir)
+    pcfg = load_problem_config(cdir / "problem.toml")
+    scfg = load_solver_config(cdir / "solver.toml")
+    scfg.cut_selection = args.cut_selection
+    scfg.n_processes = args.workers
+    if scfg.cut_selection != "julia":
+        raise SystemExit("本 runner 只用于 cut_selection=julia")
+    print(f"async Tier2 T={pcfg.T} pool={pcfg.pool_size} workers={args.workers} "
+          f"scope={scfg.integer_scope} seconds={args.seconds:g}")
+    print(scfg.describe())
+    prob = DefineProblem(pcfg)
+    print_summary(prob)
+
+    d = new_run_dir("tier2_async_cutpool_2h", str(ROOT / scfg.results_root))
+    print(f"结果目录：{d}")
+    write_configs(d, cdir / "problem.toml", cdir / "solver.toml")
+    save_json(d, "problem_data.json", to_json(prob))
+
+    log = TrainingLog(d, "sddp_training_log.csv")
+    eng = AsyncIterationEngine(prob, make_stage_subproblem, scfg,
+                               results_dir=d, log=print,
+                               n_workers=args.workers, paths_per_task=1)
+    t0 = time.time()
+    eng.on_iter = lambda rec: log.row(rec["iter"], rec["sim"], rec["lb"],
+                                      rec["time"], rec["solves"])
+    hist = []
+    try:
+        hist = eng.train(args.iters, max_seconds=args.seconds,
+                         start_iter=1, verbose=True)
+    finally:
+        log.close()
+        cuts = (eng.cut_pool.all_by_stage()
+                if eng.cut_pool is not None else eng.cuts)
+        save_cuts(d, cuts[:eng.T + 1], eng.meta())
+        lb = eng.lower_bound()
+        text = "\n".join([
+            f"结果目录    : {d}",
+            "模式        : async_iteration, forward=MIP, backward=LP",
+            f"integer     : {scfg.integer_scope}",
+            f"训练轮次    : {len(hist)}",
+            f"下界 LB     : {lb:.6f}",
+            f"历史 LB max : {eng.lb_best:.6f}",
+            f"割数        : {sum(len(c) for c in eng.cuts[1:eng.T + 1])}",
+            f"累计求解    : {eng.n_solves}",
+            f"用时        : {time.time() - t0:.1f} s",
+            "",
+            "训练与仿真分离：UB/gap 需要另跑 simulate.py",
+        ])
+        print("\n" + text)
+        save_summary(d, text + "\n")
+        eng.close()
+    print(f"完成：{d}")
+
+
+if __name__ == "__main__":
+    main()
