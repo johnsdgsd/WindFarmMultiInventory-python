@@ -15,11 +15,13 @@ n_backward_samples = 0
 checkpoint_interval = 600.0   # 秒；训练中周期性落盘割
 max_train_seconds = 0         # 墙钟训练时限（秒）；0 = 不限。到时限后当前轮结束即停并存割。
 
-# 割筛选（docs/LML1割筛选算法逻辑.md）
+# 割筛选
+#   julia：默认。SDDP.jl 风格割池：缓存全部割，non_dominated_count 决定活跃割；
+#          不支配任何采样点的割移出 LP 但保留，之后可复活。
 #   lml1：对每个历史试探点只保留"在该点取值最大、且生成最早"的那条割；没有被任何点
 #         选中的割直接删除。割数由「轮数 × 路径数」的线性增长变成"被选中的割"数量。
 #   none：不筛选（每条割无条件入库）
-cut_selection = "lml1"
+cut_selection = "julia"
 cut_select_eps = 1e-6           # ε0：判断两个割值是否并列
 cut_select_keep_rounds = 0      # 试探点保留的轮数；0 = 全部保留（文档原版）
 seed = 2026

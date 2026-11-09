@@ -110,6 +110,9 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
             if eng.cut_selection == "lml1":
                 n_hist = eng.restore_cut_history()
                 print(f"LML1 历史已从割的 state 重建：{n_hist} 条记录")
+            elif eng.cut_selection == "julia":
+                n_pool = eng.restore_cut_pool()
+                print(f"Julia 式割池已从割的 state 重建：{n_pool} 条活跃割")
             start_iter = int(meta.get("n_iterations", 0)) + 1
             archive_log(d)
             print(f"续训：从 {d} 读回 {sum(len(c) for c in cuts)} 条割，"

@@ -82,6 +82,8 @@ class StageSubproblem:
         self._state_vec = None
         self._scene = None
         self._cut_rows = []
+        self._cut_uids = {}
+        self._cut_seq = 0
         self._cut_key = None
         self._state_coeff = {}
         self._pin_map = {}
@@ -249,6 +251,7 @@ class StageSubproblem:
         if self._cut_rows:
             m.remove(list(self._cut_rows))
             self._cut_rows = []
+            self._cut_uids = {}
 
         if cuts_next is None or len(cuts_next[0]) == 0:
             # 末阶段或空割集：theta 钉在 0。空割集必须走这里，否则 LP 无界。
@@ -274,6 +277,75 @@ class StageSubproblem:
             m.setInfo(COPT.Info.Obj, [self._theta], 1.0)
         self._cut_key = key
         return self
+
+    def _add_cut_row(self, c):
+        """给一条 Cut 加割行；调用方负责 theta 的界/目标。"""
+        b = np.asarray(c.beta, dtype=float)
+        nz = np.nonzero(np.abs(b) > CUT_EPS)[0]
+        expr = LinExpr()
+        expr.reserve(nz.size + 1)
+        expr.addTerm(self._theta, 1.0)
+        if nz.size:
+            expr.addTerms([self.x_out[j] for j in nz], -b[nz])
+        row = self.model.addConstr(expr >= float(c.alpha),
+                                   name=f"cut_{self._cut_seq}")
+        self._cut_seq += 1
+        self._cut_rows.append(row)
+        self._cut_uids[c.uid] = row
+        return row
+
+    def _unpin_theta(self) -> None:
+        m = self.model
+        m.setInfo(COPT.Info.LB, [self._theta], -INF)
+        m.setInfo(COPT.Info.UB, [self._theta], INF)
+        m.setInfo(COPT.Info.Obj, [self._theta], 1.0)
+
+    def set_cuts(self, cuts, key=None) -> "StageSubproblem":
+        """用带 `uid` 的 Cut 列表整体设置割集（异步 worker 初始化用）。"""
+        m = self.model
+        if self._cut_rows:
+            m.remove(list(self._cut_rows))
+        self._cut_rows = []
+        self._cut_uids = {}
+        if not cuts:
+            m.setInfo(COPT.Info.LB, [self._theta], 0.0)
+            m.setInfo(COPT.Info.UB, [self._theta], 0.0)
+            m.setInfo(COPT.Info.Obj, [self._theta], 0.0)
+        else:
+            self._unpin_theta()
+            for c in cuts:
+                self._add_cut_row(c)
+        self._cut_key = key
+        return self
+
+    def append_cuts(self, cuts) -> "StageSubproblem":
+        """只追加带 `uid` 的割行，不删除已有行。"""
+        if not cuts:
+            return self
+        if not self._cut_rows:
+            self._unpin_theta()
+        for c in cuts:
+            self._add_cut_row(c)
+        self._cut_key = None
+        return self
+
+    def remove_cuts(self, uids) -> int:
+        """按 uid 删除割行；返回实际删除数。"""
+        rows = []
+        for uid in uids:
+            row = self._cut_uids.pop(uid, None)
+            if row is not None:
+                rows.append(row)
+        if rows:
+            self.model.remove(rows)
+        self._cut_rows = list(self._cut_uids.values())
+        if not self._cut_rows:
+            m = self.model
+            m.setInfo(COPT.Info.LB, [self._theta], 0.0)
+            m.setInfo(COPT.Info.UB, [self._theta], 0.0)
+            m.setInfo(COPT.Info.Obj, [self._theta], 0.0)
+        self._cut_key = None
+        return len(rows)
 
     # ---------------------------------------------------------------- 改参数
     def set_state(self, x, *, require_int: bool = False) -> "StageSubproblem":

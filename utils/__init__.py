@@ -26,12 +26,14 @@
 """
 
 from .cut import Cut, FORMAT_VERSION, pack, trivial_cut
+from .cut_pool import CutPool, StageCutPool
 from .copt_env import SolverError, dump_lp
 from .engine import SDDPEngine
 from .simulation import SimStats, simulate, simulate_paths
 
 __all__ = [
     "Cut", "FORMAT_VERSION", "pack", "trivial_cut",
+    "CutPool", "StageCutPool",
     "SolverError", "dump_lp",
     "SDDPEngine",
     "SimStats", "simulate", "simulate_paths",
