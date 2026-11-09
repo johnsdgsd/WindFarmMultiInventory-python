@@ -1,0 +1,13 @@
+# Julia training outputs are self-contained and large; never commit them.
+**/results/
+**/SDDP.log
+**/model_cut*.json
+**/*.mof.json
+**/*.lp
+**/*.iis
+**/*.sol
+**/*.bin
+# Generated validation logs / stage dumps / smoke artifacts
+**/test/_*
+**/model_infeasible*.json
+**/model_infeasible*.cuts.json
