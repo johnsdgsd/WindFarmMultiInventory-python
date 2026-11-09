@@ -27,6 +27,7 @@ from pathlib import Path
 import numpy as np
 
 from .cut import Cut, trivial_cut
+from .cut_pool import CutPool
 from .importance import Proposal, build_global_proposal, weight_stats
 from .io import TrainingLog, save_cuts
 from .payload import StagePayload, put_cuts
@@ -112,8 +113,18 @@ class SDDPEngine:
         # 割筛选（docs/LML1割筛选算法逻辑.md）：每期维护历史试探点，以及每个点上
         # 「目前取值最大的、且生成最早」的那条割。未被任何点选中的割直接删除。
         self.cut_selection = str(getattr(cfg, "cut_selection", "none"))
+        if self.cut_selection not in ("none", "lml1", "julia"):
+            raise ValueError(f"cut_selection 只能是 none/lml1/julia："
+                             f"{self.cut_selection!r}")
         self.cut_select_eps = float(getattr(cfg, "cut_select_eps", 1e-6))
         self.cut_select_keep_rounds = int(getattr(cfg, "cut_select_keep_rounds", 0))
+        self.cut_deletion_minimum = int(getattr(cfg, "cut_deletion_minimum", 1))
+        self.cut_pool = None
+        if self.cut_selection == "julia":
+            self.cut_pool = CutPool(self.T, self.cut_deletion_minimum)
+            for t in range(1, self.T + 1):
+                self.cut_pool.seed(t, self.cuts[t])
+                self.cuts[t] = self.cut_pool.active(t)
         self._pts: list[list] = [[] for _ in range(self.T + 1)]   # 历史试探点
         self._mx: list[list] = [[] for _ in range(self.T + 1)]    # 该点处当前最大割值
         self._rc: list[list] = [[] for _ in range(self.T + 1)]    # 保留的最旧最大割
@@ -247,14 +258,32 @@ class SDDPEngine:
                 else:
                     beta, obj = res
                 c = Cut(float(obj) - float(beta @ x), beta, x, t, float(obj), it)
-                self.cuts[t].append(c)
+                if self.cut_pool is not None:
+                    _, deactivated = self.cut_pool.add(t, c)
+                    self.n_cut_dropped += len(deactivated)
+                else:
+                    self.cuts[t].append(c)
                 new_cuts.append(c)
                 n_added += 1
+            if self.cut_pool is not None:
+                self.cuts[t] = self.cut_pool.active(t)
             if stage_lift and gains:
                 self._last_lift_gain = float(np.mean(gains))
             if self.cut_selection == "lml1":
                 self._lml1_update(t, points, new_cuts)
         return n_added
+
+    def restore_cut_pool(self) -> int:
+        """resume 后把已加载的割重新装入 Julia 式缓存池。"""
+        if self.cut_pool is None:
+            return 0
+        self.cut_pool = CutPool(self.T, self.cut_deletion_minimum)
+        n = 0
+        for t in range(1, self.T + 1):
+            self.cut_pool.seed(t, self.cuts[t])
+            self.cuts[t] = self.cut_pool.active(t)
+            n += len(self.cuts[t])
+        return n
 
     # ------------------------------------------------------------ LML1 割筛选
     def restore_cut_history(self) -> int:
@@ -460,7 +489,9 @@ class SDDPEngine:
     def checkpoint(self) -> Path | None:
         if self.results_dir is None:
             return None
-        return save_cuts(self.results_dir, self.cuts, self.meta())
+        cuts = (self.cut_pool.all_by_stage()
+                if self.cut_pool is not None else self.cuts)
+        return save_cuts(self.results_dir, cuts, self.meta())
 
     def meta(self) -> dict:
         return {"T": self.T, "state_dim": self.state_dim, "seed": self.seed,

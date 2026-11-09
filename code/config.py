@@ -418,8 +418,8 @@ class SolverConfig:
         if self.n_backward_samples < 0:
             raise ValueError(f"[training] n_backward_samples 不得为负（0 = 全枚举），"
                              f"实际 {self.n_backward_samples}")
-        if self.cut_selection not in ("none", "lml1"):
-            raise ValueError(f"[training] cut_selection 只能是 none/lml1，"
+        if self.cut_selection not in ("none", "lml1", "julia"):
+            raise ValueError(f"[training] cut_selection 只能是 none/lml1/julia，"
                              f"实际 {self.cut_selection!r}")
         if self.cut_select_eps < 0:
             raise ValueError(f"[training] cut_select_eps 不得为负，"
