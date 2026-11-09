@@ -160,7 +160,24 @@ def backward_point_task(task):
             try:
                 sub.solve_lp()
             except Exception as exc:
-                raise _fail("backward", t, si, sub, exc)
+                # COPT 偶发在“前向 MIP → 换割 → 后向 LP”后保留无效基；
+                # 重建一次共享模型再试，仍失败才按真错误上报。
+                old = _W.get("shared")
+                if old is not None:
+                    try:
+                        old.free()
+                    except Exception:
+                        pass
+                    _W["shared"] = None
+                    sub = _shared_sub(t, cuts_next, (round_id, t, "bwd"))
+                    sub.set_state(x, require_int=int_mode)
+                    sub.set_scene(prob.pool[si])
+                    try:
+                        sub.solve_lp()
+                    except Exception as exc2:
+                        raise _fail("backward", t, si, sub, exc2)
+                else:
+                    raise _fail("backward", t, si, sub, exc)
             beta = np.asarray(sub.gradient("dj"), float)
             lp_obj = float(sub.obj)
             grads[k] = beta

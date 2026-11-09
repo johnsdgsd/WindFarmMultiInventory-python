@@ -118,14 +118,25 @@ class SDDPEngine:
         self._mx: list[list] = [[] for _ in range(self.T + 1)]    # 该点处当前最大割值
         self._rc: list[list] = [[] for _ in range(self.T + 1)]    # 保留的最旧最大割
         self._pool = None
+        self._start_pool()
+
+    def _start_pool(self) -> None:
         if self.n_processes > 1:
             self._pool = _default_ctx().Pool(
                 self.n_processes, initializer=init_worker,
-                initargs=(prob, make_sub, cfg, self.T, self.initial_state,
-                          self.results_dir))
+                initargs=(self.prob, self.make_sub, self.cfg, self.T,
+                          self.initial_state, self.results_dir))
         else:
-            init_worker(prob, make_sub, cfg, self.T, self.initial_state,
-                        self.results_dir)
+            init_worker(self.prob, self.make_sub, self.cfg, self.T,
+                        self.initial_state, self.results_dir)
+
+    def _restart_pool(self) -> None:
+        """重建 worker 进程；用于丢弃已被 COPT 污染的长驻模型/环境。"""
+        if self._pool is not None:
+            self._pool.terminate()
+            self._pool.join()
+            self._pool = None
+        self._start_pool()
 
     # ---------------------------------------------------------------- 调度
     def _map(self, fn, tasks):
@@ -213,7 +224,16 @@ class SDDPEngine:
             try:
                 tasks = [(self.round_id, t, i, np.asarray(x, dtype=float), inds[i],
                           blk.ref, stage_lift) for i, x in enumerate(points)]
-                results = self._map(backward_point_task, tasks)
+                try:
+                    results = self._map(backward_point_task, tasks)
+                except Exception:
+                    if self._pool is None:
+                        raise
+                    # COPT 偶发在 MIP/LP 切换后让长驻 worker 的 solveLP 失效；
+                    # 重建进程池，复用同一试探点/割载荷重试本阶段。
+                    self.log(f"[warn] backward t={t} 失败，重建 worker 进程池后重试")
+                    self._restart_pool()
+                    results = self._map(backward_point_task, tasks)
             finally:
                 blk.close()
             self.n_solves += sum(len(s) for s in inds)

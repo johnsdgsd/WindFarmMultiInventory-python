@@ -132,6 +132,9 @@ def main(*, config_dir: str = "config", iterations: int | None = None,
                     f"{m_round}/{m_n0}/{m_is}/{m_cl} 与当前配置不一致，不能续训")
             eng.cuts = cuts
             eng.lb_best = float(meta.get("lb_best", 0.0))
+            # 续训若在第一轮前失败，finally 的 checkpoint 仍应保留原轮次，
+            # 不能把 meta 写成 0。
+            eng.last_iter = int(meta.get("n_iterations", 0))
             eng.restore_importance(meta)
             if eng.cut_selection == "lml1":
                 n_hist = eng.restore_cut_history()
