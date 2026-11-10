@@ -149,6 +149,54 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
         apply_ack(ack)
 
     default_block_size = int(getattr(cfg, "stage_block_size", 0) or 0)
+    online_update = bool(getattr(cfg, "online_cut_update", False))
+
+    def online_run(round_id, scene_paths):
+        """前向逐阶段：到达 t 时先生成 V_t 割并同步，再走 t 的决策。
+
+        这是“在线一步更新”原型：没有单独的完整后向；每阶段的新割在
+        同一条路径继续向前之前就广播给其他 worker。
+        """
+        new_cuts = [[] for _ in range(T + 2)]
+        totals = np.zeros(len(scene_paths))
+        n_solves = 0
+        inds = _scene_indices(cfg, round_id, len(prob.pool))
+        for ki, scene_path in enumerate(scene_paths):
+            x = np.asarray(initial_state, dtype=float).copy()
+            # 阶段 0：只解前向，不生成 V_0 割
+            sub = cut_model(1)
+            sub.set_state(x)
+            _solve_forward(sub, cfg)
+            n_solves += 1
+            x = sub.out_state_vector()
+            for t in range(1, T + 1):
+                sub = cut_model(t + 1)
+                # 用当前 x 生成 V_t 割（后向一步）
+                sub.set_state(x)
+                grads = np.empty((len(inds), prob.state_dim))
+                objs = np.empty(len(inds))
+                for j, si in enumerate(inds):
+                    sub.set_scene(prob.pool[si])
+                    sub.solve_lp()
+                    n_solves += 1
+                    grads[j] = sub.gradient("dj")
+                    objs[j] = float(sub.obj)
+                beta = grads.mean(axis=0)
+                obj = float(objs.mean())
+                c = Cut(float(obj) - float(beta @ x), beta, x, t, obj,
+                        int(round_id))
+                c.uid = ("online", wid, int(round_id), t, ki)
+                add_cut(t, c)
+                new_cuts[t].append(c)
+                sync_block(round_id, new_cuts, force=True)
+                new_cuts = [[] for _ in range(T + 2)]
+                # 当前阶段前向决策
+                sub.set_point(x, prob.pool[int(scene_path[t - 1])])
+                _solve_forward(sub, cfg)
+                n_solves += 1
+                totals[ki] += float(sub.stage_cost())
+                x = sub.out_state_vector()
+        return totals, n_solves, new_cuts
 
     while True:
         cmd = task_q.get()
@@ -191,10 +239,17 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
         try:
             x0 = np.asarray(initial_state, dtype=float).copy()
             K = len(scene_paths)
+            n_solves = 0
+            if online_update:
+                totals, n_solves, new_cuts = online_run(round_id, scene_paths)
+                result_q.put(("ok", wid, int(round_id),
+                              float(totals.mean()), n_solves, new_cuts,
+                              {"n_cuts": 0, "n_mip": 0, "n_fb": 0,
+                               "gain_sum": 0.0}, {}))
+                continue
             # trial[t][k] = 第 t 期入库状态（第 k 条路径）
             trial = [[None] * K for _ in range(T + 1)]
             totals = np.zeros(K)
-            n_solves = 0
 
             # forward：同一切割快照下顺序走 K 条路径
             for k, scene_path in enumerate(scene_paths):
@@ -639,6 +694,8 @@ class AsyncIterationEngine:
                 "stage_block_size": int(getattr(
                     self.cfg, "stage_block_size", 0) or 0),
                 "stage_block_adaptive": self._stage_block_adaptive,
+                "online_cut_update": bool(getattr(
+                    self.cfg, "online_cut_update", False)),
                 "stage_block_sizes": list(self._stage_block_sizes),
                 "stage_block_switch_s": list(self._stage_block_switch_s),
                 "block_hist": dict(self._block_hist),
