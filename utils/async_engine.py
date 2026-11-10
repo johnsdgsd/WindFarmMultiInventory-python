@@ -109,6 +109,28 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
             if sub is not None:
                 sub.append_cuts([c])
 
+    def apply_ack(ack):
+        _, new_cuts, activate_uids, deactivate_uids = ack[:4]
+        for s, gone in enumerate(deactivate_uids):
+            deactivate(s, gone)
+        for s, ds in enumerate(new_cuts):
+            for c in ds:
+                all_cuts[s][c.uid] = c
+        for s, uids in enumerate(activate_uids):
+            activate(s, uids)
+
+    def sync_block(round_id: int, new_cuts):
+        """阶段块边界：把本块新割交给主进程，并取回最新全局割增量。"""
+        result_q.put(("sync", wid, int(round_id), new_cuts))
+        ack = task_q.get()
+        if ack is None:
+            raise RuntimeError("worker received shutdown while waiting for block ack")
+        if ack[0] != "ack":
+            raise RuntimeError(f"worker expected ack, got {ack[0]!r}")
+        apply_ack(ack)
+
+    block_size = int(getattr(cfg, "stage_block_size", 0) or 0)
+
     while True:
         cmd = task_q.get()
         if cmd is None:
@@ -147,6 +169,8 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
             for k, scene_path in enumerate(scene_paths):
                 x = x0.copy()
                 for t in range(0, T + 1):
+                    if block_size and t > 1 and (t - 1) % block_size == 0:
+                        sync_block(round_id, [[] for _ in range(T + 2)])
                     # 求解第 t 期用 cuts[t+1] 作为未来成本
                     sub = cut_model(t + 1)
                     if t == 0:
@@ -214,6 +238,10 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
                 for c in stage_cuts:
                     add_cut(t, c)
                 new_cuts[t].extend(stage_cuts)
+                if (block_size and t > 1
+                        and (T - t + 1) % block_size == 0):
+                    sync_block(round_id, new_cuts)
+                    new_cuts = [[] for _ in range(T + 2)]
             result_q.put(("ok", wid, int(round_id), float(totals.mean()),
                           n_solves, new_cuts, lift_stats))
         except Exception:
@@ -273,6 +301,7 @@ class AsyncIterationEngine:
         self.n_lift_cuts = 0
         self.n_lift_mip = 0
         self.n_lift_fallback = 0
+        self.n_block_syncs = 0
         self._lift_rounds = []
         self._lift_gains = []
         self._last_lb = None
@@ -334,10 +363,8 @@ class AsyncIterationEngine:
                 and int(k) >= self._cl_min_round
                 and self._prev_lb_delta < self._cl_threshold)
 
-    def _dispatch(self, wid: int, k: int):
-        if self.cut_pool is not None:
-            return self._dispatch_julia(wid, k)
-        # 发送该 worker 尚未持有的割，以及主进程 LML1 已经删掉的割。
+    def _plain_delta(self, wid: int):
+        """worker 尚未持有的割，以及主进程已经删掉的割。"""
         seen = self._view_uids[wid]
         deltas = []
         deletions = []
@@ -351,13 +378,9 @@ class AsyncIterationEngine:
                 seen.discard(uid)
             deltas.append(new)
             deletions.append(gone)
-        scene_paths = [self.rng.integers(0, self.n_scenes,
-                                        size=self.T).tolist()
-                       for _ in range(self.paths_per_task)]
-        self._task_q[wid].put(
-            ("iter", k, scene_paths, deltas, deletions, self._lift_now(k)))
+        return deltas, deletions
 
-    def _dispatch_julia(self, wid: int, k: int):
+    def _julia_delta(self, wid: int):
         """同步“全部割缓存”和“当前活跃割”两类增量。"""
         seen_all = self._view_all[wid]
         seen_active = self._view_active[wid]
@@ -379,6 +402,29 @@ class AsyncIterationEngine:
             new_cuts.append(new)
             activate.append([c.uid for c in act])
             deactivate.append(deact)
+        return new_cuts, activate, deactivate
+
+    def _send_ack(self, wid: int):
+        """只同步割，不派新 iteration；用于阶段块边界。"""
+        if self.cut_pool is not None:
+            new, activate, deactivate = self._julia_delta(wid)
+        else:
+            new, deactivate = self._plain_delta(wid)
+            activate = [[] for _ in range(self.T + 2)]
+        self._task_q[wid].put(("ack", new, activate, deactivate))
+
+    def _dispatch(self, wid: int, k: int):
+        if self.cut_pool is not None:
+            return self._dispatch_julia(wid, k)
+        deltas, deletions = self._plain_delta(wid)
+        scene_paths = [self.rng.integers(0, self.n_scenes,
+                                        size=self.T).tolist()
+                       for _ in range(self.paths_per_task)]
+        self._task_q[wid].put(
+            ("iter", k, scene_paths, deltas, deletions, self._lift_now(k)))
+
+    def _dispatch_julia(self, wid: int, k: int):
+        new_cuts, activate, deactivate = self._julia_delta(wid)
         scene_paths = [self.rng.integers(0, self.n_scenes,
                                         size=self.T).tolist()
                        for _ in range(self.paths_per_task)]
@@ -522,6 +568,9 @@ class AsyncIterationEngine:
                 "lb_best": self.lb_best,
                 "mode": "async_iteration",
                 "cut_selection": self.cut_selection,
+                "stage_block_size": int(getattr(
+                    self.cfg, "stage_block_size", 0) or 0),
+                "n_block_syncs": self.n_block_syncs,
                 "n_cut_dropped": self.n_cut_dropped,
                 "integer_mode": bool(getattr(self.cfg, "integer_enabled", False)),
                 "integer_scope": str(getattr(self.cfg, "integer_scope", "none")),
@@ -582,6 +631,11 @@ class AsyncIterationEngine:
                 outstanding += 1
             while outstanding > 0:
                 kind, wid, k, *rest = self._result_q.get()
+                if kind == "sync":
+                    self._merge(wid, rest[0])
+                    self._send_ack(wid)
+                    self.n_block_syncs += 1
+                    continue
                 outstanding -= 1
                 if kind == "err":
                     raise RuntimeError(f"async worker {wid} iter {k} failed:\n{rest[0]}")

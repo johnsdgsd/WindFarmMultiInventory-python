@@ -374,6 +374,7 @@ class SolverConfig:
     cut_selection: str
     cut_select_eps: float
     cut_select_keep_rounds: int
+    stage_block_size: int
     integer: IntegerConfig
     importance_sampling: ImportanceSamplingConfig
     cut_lift: CutLiftConfig
@@ -449,6 +450,9 @@ class SolverConfig:
         if self.cut_select_keep_rounds < 0:
             raise ValueError(f"[training] cut_select_keep_rounds 不得为负，"
                              f"实际 {self.cut_select_keep_rounds}")
+        if self.stage_block_size < 0:
+            raise ValueError(f"[training] stage_block_size 不得为负（0 = 关闭），"
+                             f"实际 {self.stage_block_size}")
         if self.max_train_seconds < 0:
             raise ValueError(f"[training] max_train_seconds 不得为负（0 = 不限），"
                              f"实际 {self.max_train_seconds}")
@@ -478,6 +482,7 @@ class SolverConfig:
             f"（{self.forward_paths_per_process} × {self.n_processes} 进程）"
             f"  后向场景 {self.n_backward_samples or '全枚举'}"
             f"  割筛选 {self.cut_selection}"
+            f"  阶段块 {self.stage_block_size or 'off'}"
             f"  整数 {self.integer.describe()}"
             f"  重要性采样 {self.importance_sampling.describe()}"
             f"  割提升 {self.cut_lift.describe()}"
@@ -568,6 +573,8 @@ def load_solver_config(path, *, resolve: bool = True) -> SolverConfig:
         cut_selection=str(_req(tr, "cut_selection", "solver.toml/training")),
         cut_select_eps=float(_req(tr, "cut_select_eps", "solver.toml/training")),
         cut_select_keep_rounds=int(_req(tr, "cut_select_keep_rounds", "solver.toml/training")),
+        stage_block_size=int(_opt(tr, "stage_block_size", 0,
+                                  "solver.toml/training")),
         integer=integer,
         importance_sampling=importance,
         cut_lift=cut_lift,
