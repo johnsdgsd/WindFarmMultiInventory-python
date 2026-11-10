@@ -296,6 +296,8 @@ class CutLiftConfig:
 
     enabled: bool = False
     scope: str = "all"
+    last_k: int = 0
+    lift_stages: tuple[int, ...] = ()
     mode: str = "always"
     value: str = "exact"
     time_limit: float = 5.0
@@ -306,9 +308,24 @@ class CutLiftConfig:
     min_round: int = 50
 
     def __post_init__(self) -> None:
-        if self.scope not in ("all", "last"):
+        if self.scope not in ("all", "last", "tail", "selected"):
             raise ValueError(
-                f"[cut_lift] scope 只能是 all/last，实际 {self.scope!r}")
+                f"[cut_lift] scope 只能是 all/last/tail/selected，"
+                f"实际 {self.scope!r}")
+        if int(self.last_k) < 0:
+            raise ValueError(
+                f"[cut_lift] last_k 不得为负，实际 {self.last_k!r}")
+        if self.scope == "tail" and int(self.last_k) < 1:
+            raise ValueError(
+                "[cut_lift] scope=tail 必须设置 last_k ≥ 1")
+        stages = tuple(int(t) for t in self.lift_stages)
+        if any(t < 1 for t in stages):
+            raise ValueError(
+                f"[cut_lift] lift_stages 必须是正阶段号，实际 {stages!r}")
+        if self.scope == "selected" and not stages:
+            raise ValueError(
+                "[cut_lift] scope=selected 必须设置非空 lift_stages")
+        self.lift_stages = stages
         if self.mode not in ("always", "stagnation"):
             raise ValueError(f"[cut_lift] mode 只能是 always/stagnation，实际 {self.mode!r}")
         if self.value not in ("exact", "best_bnd"):
@@ -334,7 +351,12 @@ class CutLiftConfig:
     def describe(self) -> str:
         if not self.enabled:
             return "off"
-        return (f"on  scope={self.scope}  mode={self.mode}  value={self.value}  "
+        scope = self.scope
+        if scope == "tail":
+            scope = f"tail(last_k={self.last_k})"
+        elif scope == "selected":
+            scope = f"selected({list(self.lift_stages)})"
+        return (f"on  scope={scope}  mode={self.mode}  value={self.value}  "
                 f"time_limit={self.time_limit:g}s  rel_gap={self.rel_gap:g}"
                 + (f"  threshold={self.lb_gain_threshold:g}  min_round={self.min_round}"
                    if self.mode == "stagnation" else ""))
@@ -519,6 +541,9 @@ def load_solver_config(path, *, resolve: bool = True) -> SolverConfig:
         cut_lift = CutLiftConfig(
             enabled=bool(_req(cl_raw, "enabled", "solver.toml/cut_lift")),
             scope=str(_req(cl_raw, "scope", "solver.toml/cut_lift")),
+            last_k=int(_opt(cl_raw, "last_k", 0, "solver.toml/cut_lift")),
+            lift_stages=tuple(int(t) for t in _opt(
+                cl_raw, "lift_stages", [], "solver.toml/cut_lift")),
             mode=str(_opt(cl_raw, "mode", "always", "solver.toml/cut_lift")),
             value=str(_opt(cl_raw, "value", "exact", "solver.toml/cut_lift")),
             time_limit=float(_req(cl_raw, "time_limit", "solver.toml/cut_lift")),

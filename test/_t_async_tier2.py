@@ -26,6 +26,10 @@ def main():
     ap.add_argument("--iters", type=int, default=100000)
     ap.add_argument("--workers", type=int, default=10)
     ap.add_argument("--cut-selection", default="julia")
+    ap.add_argument("--last-k", type=int, default=0,
+                    help="只 lift 最后 k 个阶段；>0 时覆盖 scope=tail")
+    ap.add_argument("--lift-stages", default=None,
+                    help="逗号分隔的阶段号；设置后覆盖 scope=selected")
     ap.add_argument("--tag", default=None,
                     help="结果目录前缀；默认用 solver.toml 的 [output].tag")
     ap.add_argument("--config-dir",
@@ -37,6 +41,19 @@ def main():
     scfg = load_solver_config(cdir / "solver.toml")
     scfg.cut_selection = args.cut_selection
     scfg.n_processes = args.workers
+    if args.last_k > 0:
+        if not scfg.cut_lift.enabled:
+            raise SystemExit("--last-k 需要 [cut_lift].enabled=true")
+        scfg.cut_lift.scope = "tail"
+        scfg.cut_lift.last_k = int(args.last_k)
+    if args.lift_stages:
+        if not scfg.cut_lift.enabled:
+            raise SystemExit("--lift-stages 需要 [cut_lift].enabled=true")
+        stages = tuple(int(s) for s in args.lift_stages.split(",") if s.strip())
+        if not stages:
+            raise SystemExit("--lift-stages 不能为空")
+        scfg.cut_lift.scope = "selected"
+        scfg.cut_lift.lift_stages = stages
     if scfg.cut_selection != "julia":
         raise SystemExit("本 runner 只用于 cut_selection=julia")
     print(f"async Tier2 T={pcfg.T} pool={pcfg.pool_size} workers={args.workers} "

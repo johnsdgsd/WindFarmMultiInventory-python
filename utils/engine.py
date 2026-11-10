@@ -104,6 +104,9 @@ class SDDPEngine:
         cl = getattr(cfg, "cut_lift", None)
         self._cl_mode = str(getattr(cl, "mode", "always"))
         self._cl_scope = str(getattr(cl, "scope", "all"))
+        self._cl_last_k = int(getattr(cl, "last_k", 0))
+        self._cl_stages = frozenset(
+            int(t) for t in (getattr(cl, "lift_stages", ()) or ()))
         self._cl_threshold = float(getattr(cl, "lb_gain_threshold", 20.0))
         self._cl_min_round = int(getattr(cl, "min_round", 50))
         self.lb_best = 0.0          # 历史最大合法 LB（LML1 删割时当前 LB 可能下降）
@@ -229,7 +232,11 @@ class SDDPEngine:
                 continue
             stage_lift = bool(lift and (
                 self._cl_scope == "all"
-                or (self._cl_scope == "last" and t == self.T)))
+                or (self._cl_scope == "last" and t == self.T)
+                or (self._cl_scope == "tail"
+                    and t > self.T - self._cl_last_k)
+                or (self._cl_scope == "selected"
+                    and t in self._cl_stages)))
             inds = self._sample_scenes(len(points))
             blk = put_cuts(self.cuts[t + 1] if t < self.T else [], self.state_dim)
             try:
@@ -523,6 +530,8 @@ class SDDPEngine:
                 "cut_lift": {
                     "enabled": bool(getattr(self.cfg, "cut_lift_enabled", False)),
                     "scope": str(getattr(self.cfg.cut_lift, "scope", "all")),
+                    "last_k": self._cl_last_k,
+                    "lift_stages": sorted(self._cl_stages),
                     "mode": self._cl_mode,
                     "value": str(getattr(self.cfg.cut_lift, "value", "exact")),
                     "lb_gain_threshold": self._cl_threshold,

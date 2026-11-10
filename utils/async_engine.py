@@ -52,6 +52,9 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
     lift_enabled = bool(getattr(cfg, "cut_lift_enabled", False))
     lcfg = getattr(cfg, "cut_lift", None)
     lift_scope = str(getattr(lcfg, "scope", "all"))
+    lift_last_k = int(getattr(lcfg, "last_k", 0))
+    lift_stages = frozenset(
+        int(t) for t in (getattr(lcfg, "lift_stages", ()) or ()))
     lift_value = str(getattr(lcfg, "value", "exact"))
     lift_time = float(getattr(lcfg, "time_limit", 5.0))
     lift_rel = float(getattr(lcfg, "rel_gap", 0.0))
@@ -164,7 +167,10 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
             for t in range(T, 0, -1):
                 sub = cut_model(t + 1)
                 stage_lift = bool(lift_this and (
-                    lift_scope == "all" or (lift_scope == "last" and t == T)))
+                    lift_scope == "all"
+                    or (lift_scope == "last" and t == T)
+                    or (lift_scope == "tail" and t > T - lift_last_k)
+                    or (lift_scope == "selected" and t in lift_stages)))
                 stage_cuts = []
                 for k in range(K):
                     xb = np.asarray(trial[t][k], dtype=float)
@@ -257,6 +263,9 @@ class AsyncIterationEngine:
         self.cut_lift_cfg = getattr(cfg, "cut_lift", None)
         self.cut_lift_enabled = bool(getattr(cfg, "cut_lift_enabled", False))
         self._cl_scope = str(getattr(self.cut_lift_cfg, "scope", "all"))
+        self._cl_last_k = int(getattr(self.cut_lift_cfg, "last_k", 0))
+        self._cl_stages = frozenset(
+            int(t) for t in (getattr(self.cut_lift_cfg, "lift_stages", ()) or ()))
         self._cl_mode = str(getattr(self.cut_lift_cfg, "mode", "always"))
         self._cl_threshold = float(
             getattr(self.cut_lift_cfg, "lb_gain_threshold", 20.0))
@@ -419,6 +428,27 @@ class AsyncIterationEngine:
             n += len(self.cuts[t])
         return n
 
+    def seed_initial_cuts(self, cuts_by_stage) -> int:
+        """从割文件建立起始割池；必须在 train() 前调用。
+
+        cuts.json 保存的是 all_cuts，无法恢复原 active 标记，因此载入的割全部
+        视为活跃。用于“同一割池、不同 lift 阶段”的受控单轮对比。
+        """
+        if self._proc:
+            raise RuntimeError("seed_initial_cuts 必须在 start_workers 之前调用")
+        self.cuts = [[] for _ in range(self.T + 2)]
+        for t in range(1, self.T + 1):
+            self.cuts[t] = list(cuts_by_stage[t])
+        self.cut_pool = None
+        if self.cut_selection == "julia":
+            self.cut_pool = CutPool(self.T + 1, self.cut_deletion_minimum)
+            for t in range(1, self.T + 1):
+                self.cut_pool.seed(t, self.cuts[t])
+                self.cuts[t] = self.cut_pool.active(t)
+        self._lb_sub = None
+        self.lb_best = 0.0
+        return sum(len(c) for c in self.cuts[1:self.T + 1])
+
     def _lml1_update(self, t: int, new_points, new_cuts) -> None:
         """与 utils/engine.py 的 LML1 同一数学逻辑（不在这里改写算法）。
 
@@ -503,6 +533,8 @@ class AsyncIterationEngine:
                 "cut_lift": {
                     "enabled": self.cut_lift_enabled,
                     "scope": self._cl_scope,
+                    "last_k": self._cl_last_k,
+                    "lift_stages": sorted(self._cl_stages),
                     "mode": self._cl_mode,
                     "value": str(getattr(self.cut_lift_cfg, "value", "exact")),
                     "time_limit": float(getattr(
