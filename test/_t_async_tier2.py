@@ -26,6 +26,8 @@ def main():
     ap.add_argument("--iters", type=int, default=100000)
     ap.add_argument("--workers", type=int, default=10)
     ap.add_argument("--cut-selection", default="julia")
+    ap.add_argument("--tag", default=None,
+                    help="结果目录前缀；默认用 solver.toml 的 [output].tag")
     ap.add_argument("--config-dir",
                     default=str(ROOT / "test" / "_cfg_tier2_cutpool_2h"))
     args = ap.parse_args()
@@ -43,7 +45,8 @@ def main():
     prob = DefineProblem(pcfg)
     print_summary(prob)
 
-    d = new_run_dir("tier2_async_cutpool_2h", str(ROOT / scfg.results_root))
+    run_tag = args.tag or scfg.tag or "tier2_async_cutpool_2h"
+    d = new_run_dir(run_tag, str(ROOT / scfg.results_root))
     print(f"结果目录：{d}")
     write_configs(d, cdir / "problem.toml", cdir / "solver.toml")
     save_json(d, "problem_data.json", to_json(prob))
@@ -74,6 +77,9 @@ def main():
             f"历史 LB max : {eng.lb_best:.6f}",
             f"割数        : {sum(len(c) for c in eng.cuts[1:eng.T + 1])}",
             f"累计求解    : {eng.n_solves}",
+            f"割提升      : {scfg.cut_lift.describe()}",
+            f"提升统计    : cuts={eng.n_lift_cuts}  mip={eng.n_lift_mip}  "
+            f"fallback={eng.n_lift_fallback}",
             f"用时        : {time.time() - t0:.1f} s",
             "",
             "训练与仿真分离：UB/gap 需要另跑 simulate.py",

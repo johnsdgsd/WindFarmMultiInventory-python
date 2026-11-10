@@ -5,6 +5,7 @@
 
 边界：
   · 支持 cut_selection = "none" / "lml1" / "julia"；
+  · 支持后向 Strengthened Benders 割提升（cut_lift），触发由主进程决定；
   · 每个 iteration 仍是一个前向路径、后向枚举 n_backward_samples=0 的全部场景；
   · 下界在主进程重建 stage 0 LP，使用全局活跃割；
   · worker 持“缓存全部割 + 活跃割”的两层池，支持 Julia 式割的复活；
@@ -47,6 +48,15 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
                 for s in range(T + 2)]
     active_uids = [{getattr(c, "uid", None) for c in cuts[s]}
                    for s in range(T + 2)]
+    # cut_lift 与割池正交：这里只改变后向生成的割，不改变池的选择规则。
+    lift_enabled = bool(getattr(cfg, "cut_lift_enabled", False))
+    lcfg = getattr(cfg, "cut_lift", None)
+    lift_scope = str(getattr(lcfg, "scope", "all"))
+    lift_value = str(getattr(lcfg, "value", "exact"))
+    lift_time = float(getattr(lcfg, "time_limit", 5.0))
+    lift_rel = float(getattr(lcfg, "rel_gap", 0.0))
+    lift_abs = float(getattr(lcfg, "abs_gap", 0.0))
+    lift_margin = float(getattr(lcfg, "safety_margin", 1e-6))
     # 一个模型对应一个「未来割阶段」s：求解第 t=s−1 期时使用 cuts[s]。
     # s=1 由虚拟阶段 0 使用；s=2..T+1 是普通真实阶段模型（base 同 t=1）。
     cut_models = {}
@@ -101,14 +111,17 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
         if cmd is None:
             break
         if cmd[0] == "iter":
-            _, round_id, scene_paths, deltas, deletions = cmd
+            _, round_id, scene_paths, deltas, deletions = cmd[:5]
+            lift_this = bool(cmd[5]) if len(cmd) > 5 else False
             for s, gone in enumerate(deletions):
                 deactivate(s, gone)
             for s, ds in enumerate(deltas):
                 for c in ds:
                     add_cut(s, c)
         elif cmd[0] == "iterj":
-            _, round_id, scene_paths, new_cuts, activate_uids, deactivate_uids = cmd
+            (_, round_id, scene_paths, new_cuts, activate_uids,
+             deactivate_uids) = cmd[:6]
+            lift_this = bool(cmd[6]) if len(cmd) > 6 else False
             for s, gone in enumerate(deactivate_uids):
                 deactivate(s, gone)
             for s, ds in enumerate(new_cuts):
@@ -118,6 +131,7 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
                 activate(s, uids)
         else:
             continue
+        lift_this = bool(lift_this and lift_enabled)
         try:
             x0 = np.asarray(initial_state, dtype=float).copy()
             K = len(scene_paths)
@@ -145,23 +159,47 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
 
             # backward：每个阶段对 K 个试探状态各枚举场景，生成 K 条割
             new_cuts = [[] for _ in range(T + 2)]
+            lift_stats = {"n_cuts": 0, "n_mip": 0, "n_fb": 0, "gain_sum": 0.0}
             inds = _scene_indices(cfg, round_id, len(prob.pool))
             for t in range(T, 0, -1):
                 sub = cut_model(t + 1)
+                stage_lift = bool(lift_this and (
+                    lift_scope == "all" or (lift_scope == "last" and t == T)))
                 stage_cuts = []
                 for k in range(K):
                     xb = np.asarray(trial[t][k], dtype=float)
                     sub.set_state(xb)
                     grads = np.empty((len(inds), prob.state_dim))
                     objs = np.empty(len(inds))
+                    lift_vals = np.empty(len(inds)) if stage_lift else None
                     for j, si in enumerate(inds):
                         sub.set_scene(prob.pool[si])
                         sub.solve_lp()
                         n_solves += 1
-                        grads[j] = sub.gradient("dj")
-                        objs[j] = float(sub.obj)
+                        beta_j = np.asarray(sub.gradient("dj"), dtype=float)
+                        grads[j] = beta_j
+                        lp_obj = float(sub.obj)
+                        objs[j] = lp_obj
+                        if stage_lift:
+                            nu = sub.solve_lift(
+                                beta_j, time_limit=lift_time,
+                                rel_gap=lift_rel, abs_gap=lift_abs,
+                                safety_margin=lift_margin, value=lift_value)
+                            if nu is None:
+                                nu = lp_obj - float(beta_j @ xb)
+                                lift_stats["n_fb"] += 1
+                            lift_vals[j] = nu
                     beta = grads.mean(axis=0)
-                    obj = float(objs.mean())
+                    obj_lp = float(objs.mean())
+                    if stage_lift:
+                        # 与同步 worker 相同：提升值可能与 LP 割互有强弱，取 max。
+                        obj_lift = float(np.mean(lift_vals + grads @ xb))
+                        obj = max(obj_lift, obj_lp)
+                        lift_stats["n_cuts"] += 1
+                        lift_stats["n_mip"] += len(inds)
+                        lift_stats["gain_sum"] += obj - obj_lp
+                    else:
+                        obj = obj_lp
                     c = Cut(float(obj) - float(beta @ xb), beta, xb, t, obj,
                             int(round_id))
                     c.uid = ("w", wid, int(round_id), t, k)
@@ -171,7 +209,7 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
                     add_cut(t, c)
                 new_cuts[t].extend(stage_cuts)
             result_q.put(("ok", wid, int(round_id), float(totals.mean()),
-                          n_solves, new_cuts))
+                          n_solves, new_cuts, lift_stats))
         except Exception:
             result_q.put(("err", wid, int(round_id), traceback.format_exc()))
 
@@ -214,6 +252,22 @@ class AsyncIterationEngine:
             for t in range(1, self.T + 1):
                 self.cut_pool.seed(t, self.cuts[t])
                 self.cuts[t] = self.cut_pool.active(t)
+        # cut_lift 与割池、调度解耦：主进程只决定“本轮是否 lift”，
+        # scope/value/time_limit 等由 worker 在生成割时执行。
+        self.cut_lift_cfg = getattr(cfg, "cut_lift", None)
+        self.cut_lift_enabled = bool(getattr(cfg, "cut_lift_enabled", False))
+        self._cl_scope = str(getattr(self.cut_lift_cfg, "scope", "all"))
+        self._cl_mode = str(getattr(self.cut_lift_cfg, "mode", "always"))
+        self._cl_threshold = float(
+            getattr(self.cut_lift_cfg, "lb_gain_threshold", 20.0))
+        self._cl_min_round = int(getattr(self.cut_lift_cfg, "min_round", 50))
+        self.n_lift_cuts = 0
+        self.n_lift_mip = 0
+        self.n_lift_fallback = 0
+        self._lift_rounds = []
+        self._lift_gains = []
+        self._last_lb = None
+        self._prev_lb_delta = None
         self.n_solves = 0
         self.n_iterations = 0
         self.last_iter = 0
@@ -257,6 +311,20 @@ class AsyncIterationEngine:
             self._view_all.append({c.uid for lst in initial for c in lst})
             self._view_active.append({c.uid for lst in initial for c in lst})
 
+    def _lift_now(self, k: int) -> bool:
+        """本轮是否做增强割。
+
+        always 直接开；stagnation 用“最近一个已完成 iteration 的 LB 增量”判断。
+        异步环境下没有唯一的“上一轮”，这是刻意采用的全局近似口径。
+        """
+        if not self.cut_lift_enabled:
+            return False
+        if self._cl_mode == "always":
+            return True
+        return (self._prev_lb_delta is not None
+                and int(k) >= self._cl_min_round
+                and self._prev_lb_delta < self._cl_threshold)
+
     def _dispatch(self, wid: int, k: int):
         if self.cut_pool is not None:
             return self._dispatch_julia(wid, k)
@@ -277,7 +345,8 @@ class AsyncIterationEngine:
         scene_paths = [self.rng.integers(0, self.n_scenes,
                                         size=self.T).tolist()
                        for _ in range(self.paths_per_task)]
-        self._task_q[wid].put(("iter", k, scene_paths, deltas, deletions))
+        self._task_q[wid].put(
+            ("iter", k, scene_paths, deltas, deletions, self._lift_now(k)))
 
     def _dispatch_julia(self, wid: int, k: int):
         """同步“全部割缓存”和“当前活跃割”两类增量。"""
@@ -305,7 +374,8 @@ class AsyncIterationEngine:
                                         size=self.T).tolist()
                        for _ in range(self.paths_per_task)]
         self._task_q[wid].put(
-            ("iterj", k, scene_paths, new_cuts, activate, deactivate))
+            ("iterj", k, scene_paths, new_cuts, activate, deactivate,
+             self._lift_now(k)))
 
     def _merge(self, wid: int, new_cuts):
         if self.cut_pool is not None:
@@ -430,7 +500,27 @@ class AsyncIterationEngine:
                 "forward_solver": ("mip" if getattr(self.cfg, "integer_enabled", False)
                                    else "lp"),
                 "lower_bound_solver": "lp",
-                "cut_lift": {"enabled": False}}
+                "cut_lift": {
+                    "enabled": self.cut_lift_enabled,
+                    "scope": self._cl_scope,
+                    "mode": self._cl_mode,
+                    "value": str(getattr(self.cut_lift_cfg, "value", "exact")),
+                    "time_limit": float(getattr(
+                        self.cut_lift_cfg, "time_limit", 5.0)),
+                    "rel_gap": float(getattr(
+                        self.cut_lift_cfg, "rel_gap", 0.0)),
+                    "abs_gap": float(getattr(
+                        self.cut_lift_cfg, "abs_gap", 0.0)),
+                    "safety_margin": float(getattr(
+                        self.cut_lift_cfg, "safety_margin", 1e-6)),
+                    "lb_gain_threshold": self._cl_threshold,
+                    "min_round": self._cl_min_round,
+                    "n_lift_cuts": self.n_lift_cuts,
+                    "n_lift_mip": self.n_lift_mip,
+                    "n_fallback": self.n_lift_fallback,
+                    "lift_rounds": list(self._lift_rounds),
+                    "lift_gains": list(self._lift_gains),
+                }}
 
     def checkpoint(self):
         if self.results_dir is None:
@@ -463,25 +553,48 @@ class AsyncIterationEngine:
                 outstanding -= 1
                 if kind == "err":
                     raise RuntimeError(f"async worker {wid} iter {k} failed:\n{rest[0]}")
-                total, n_solves, new_cuts = rest
+                if len(rest) >= 4:
+                    total, n_solves, new_cuts, lift_stats = rest[:4]
+                else:
+                    total, n_solves, new_cuts = rest[:3]
+                    lift_stats = {}
                 self._merge(wid, new_cuts)
                 self.n_solves += int(n_solves)
                 self.n_iterations += 1
                 self.last_iter = max(self.last_iter, int(k))
+                lift_used = int(lift_stats.get("n_cuts", 0)) > 0
+                lift_gain = float(lift_stats.get("gain_sum", 0.0))
+                if lift_used:
+                    self.n_lift_cuts += int(lift_stats.get("n_cuts", 0))
+                    self.n_lift_mip += int(lift_stats.get("n_mip", 0))
+                    self.n_lift_fallback += int(lift_stats.get("n_fb", 0))
+                    self._lift_rounds.append(int(k))
+                    self._lift_gains.append(lift_gain)
                 lb = self._lower_bound()
+                self._prev_lb_delta = (None if self._last_lb is None
+                                       else lb - self._last_lb)
+                self._last_lb = lb
                 elapsed = time.time() - t0
                 rec = {"iter": int(k), "lb": lb, "sim": float(total),
                        "time": elapsed, "solves": self.n_solves,
                        "n_cuts": sum(len(c) for c in self.cuts[1:self.T + 1]),
                        "n_workers": self.n_workers,
-                       "paths_per_task": self.paths_per_task}
+                       "paths_per_task": self.paths_per_task,
+                       "lift_used": bool(lift_used),
+                       "lift_gain": lift_gain,
+                       "lift_fallback": int(lift_stats.get("n_fb", 0))}
                 history.append(rec)
                 if self.on_iter is not None:
                     self.on_iter(rec)
                 if verbose:
+                    lift_txt = ""
+                    if self.cut_lift_enabled:
+                        lift_txt = (f" | lift={int(lift_used)}"
+                                    f" gain={lift_gain:+.1f}"
+                                    f" fb={rec['lift_fallback']}")
                     self.log(f"  async iter {k:5d} | LB={lb:14.4f} | "
                              f"sim={total:14.4f} | cuts={rec['n_cuts']:6d} | "
-                             f"{elapsed:7.1f} s")
+                             f"{elapsed:7.1f} s{lift_txt}")
                 ckpt_iv = float(getattr(self.cfg, "checkpoint_interval", 0) or 0)
                 if (self.results_dir is not None and ckpt_iv > 0
                         and time.time() - last_ckpt >= ckpt_iv):
