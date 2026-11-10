@@ -183,12 +183,9 @@ def backward_point_task(task):
             grads[k] = beta
             lp_objs[k] = lp_obj
             if lift:
-                # 先解固定状态整数子问题，用其整数解作为释放状态 lift MIP 的起点。
-                # 这只是热启动；是否接受 lift 值由 solve_lift 的 exact 口径决定。
-                try:
-                    sub.solve_mip()
-                except Exception:
-                    pass
+                # 直接用当前 LP 解作为释放状态 lift MIP 的起点；固定状态 MIP 不是
+                # 数学必需，且会让每次 lift 多解一个 MIP。solve_lift 内部会用当前
+                # LP 解调用 setMipStart，是否接受 lift 值由 exact 口径决定。
                 nu = sub.solve_lift(
                     beta, time_limit=float(lcfg.time_limit),
                     rel_gap=float(lcfg.rel_gap),
