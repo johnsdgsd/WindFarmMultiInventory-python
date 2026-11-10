@@ -41,7 +41,7 @@ def _scene_indices(cfg, round_id: int, n_scenes: int):
 
 
 def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
-                 task_q, result_q):
+                 task_q, result_q, pool_version):
     cuts = [list(c) for c in initial_cuts]
     # 所有发现过的割都缓存；cuts[s] 只是当前进入 LP 的活跃割。
     all_cuts = [{getattr(c, "uid", None): c for c in cuts[s]}
@@ -109,8 +109,16 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
             if sub is not None:
                 sub.append_cuts([c])
 
+    local_version = 0
+    sync_calls = 0
+    sync_skipped = 0
+    sync_wait_s = 0.0
+
     def apply_ack(ack):
+        nonlocal local_version
         _, new_cuts, activate_uids, deactivate_uids = ack[:4]
+        if len(ack) > 4:
+            local_version = int(ack[4])
         for s, gone in enumerate(deactivate_uids):
             deactivate(s, gone)
         for s, ds in enumerate(new_cuts):
@@ -119,25 +127,42 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
         for s, uids in enumerate(activate_uids):
             activate(s, uids)
 
-    def sync_block(round_id: int, new_cuts):
-        """阶段块边界：把本块新割交给主进程，并取回最新全局割增量。"""
+    def sync_block(round_id: int, new_cuts, *, force: bool = False):
+        """阶段块边界：把本块新割交给主进程，并取回最新全局割增量。
+
+        force=False 时，如果全局版本没变且没有新割，就跳过这次往返。
+        """
+        nonlocal sync_calls, sync_skipped, sync_wait_s
+        if (not force and not any(new_cuts)
+                and int(pool_version.value) == local_version):
+            sync_skipped += 1
+            return
+        sync_calls += 1
+        t0 = time.perf_counter()
         result_q.put(("sync", wid, int(round_id), new_cuts))
         ack = task_q.get()
+        sync_wait_s += time.perf_counter() - t0
         if ack is None:
             raise RuntimeError("worker received shutdown while waiting for block ack")
         if ack[0] != "ack":
             raise RuntimeError(f"worker expected ack, got {ack[0]!r}")
         apply_ack(ack)
 
-    block_size = int(getattr(cfg, "stage_block_size", 0) or 0)
+    default_block_size = int(getattr(cfg, "stage_block_size", 0) or 0)
 
     while True:
         cmd = task_q.get()
         if cmd is None:
             break
+        block_size = default_block_size
+        task_version = None
         if cmd[0] == "iter":
             _, round_id, scene_paths, deltas, deletions = cmd[:5]
             lift_this = bool(cmd[5]) if len(cmd) > 5 else False
+            if len(cmd) > 6:
+                block_size = int(cmd[6])
+            if len(cmd) > 7:
+                task_version = int(cmd[7])
             for s, gone in enumerate(deletions):
                 deactivate(s, gone)
             for s, ds in enumerate(deltas):
@@ -147,6 +172,10 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
             (_, round_id, scene_paths, new_cuts, activate_uids,
              deactivate_uids) = cmd[:6]
             lift_this = bool(cmd[6]) if len(cmd) > 6 else False
+            if len(cmd) > 7:
+                block_size = int(cmd[7])
+            if len(cmd) > 8:
+                task_version = int(cmd[8])
             for s, gone in enumerate(deactivate_uids):
                 deactivate(s, gone)
             for s, ds in enumerate(new_cuts):
@@ -156,6 +185,8 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
                 activate(s, uids)
         else:
             continue
+        if task_version is not None:
+            local_version = task_version
         lift_this = bool(lift_this and lift_enabled)
         try:
             x0 = np.asarray(initial_state, dtype=float).copy()
@@ -240,10 +271,12 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
                 new_cuts[t].extend(stage_cuts)
                 if (block_size and t > 1
                         and (T - t + 1) % block_size == 0):
-                    sync_block(round_id, new_cuts)
+                    sync_block(round_id, new_cuts, force=True)
                     new_cuts = [[] for _ in range(T + 2)]
             result_q.put(("ok", wid, int(round_id), float(totals.mean()),
-                          n_solves, new_cuts, lift_stats))
+                          n_solves, new_cuts, lift_stats,
+                          {"calls": sync_calls, "skipped": sync_skipped,
+                           "wait_s": sync_wait_s}))
         except Exception:
             result_q.put(("err", wid, int(round_id), traceback.format_exc()))
 
@@ -302,6 +335,17 @@ class AsyncIterationEngine:
         self.n_lift_mip = 0
         self.n_lift_fallback = 0
         self.n_block_syncs = 0
+        self._stage_block_static = int(getattr(
+            cfg, "stage_block_size", 0) or 0)
+        self._stage_block_adaptive = bool(getattr(
+            cfg, "stage_block_adaptive", False))
+        self._stage_block_sizes = tuple(int(x) for x in (
+            getattr(cfg, "stage_block_sizes", ()) or ()))
+        self._stage_block_switch_s = tuple(float(x) for x in (
+            getattr(cfg, "stage_block_switch_s", ()) or ()))
+        self._t0 = None
+        self._block_hist = {}
+        self._iter_block = {}
         self._lift_rounds = []
         self._lift_gains = []
         self._last_lb = None
@@ -322,6 +366,9 @@ class AsyncIterationEngine:
         self._ctx = mp.get_context("spawn")
         self._task_q = []
         self._result_q = self._ctx.Queue()
+        self._pool_version = self._ctx.Value("q", 0)
+        self.n_sync_wait_s = 0.0
+        self.n_sync_skipped = 0
         self._proc = []
         # 每个 worker 已持有的割 uid。不能用「全局前缀长度」，因为不同 worker 的
         # 完成顺序会让全局列表的追加顺序与本 worker 的本地顺序不同。
@@ -340,7 +387,8 @@ class AsyncIterationEngine:
             p = self._ctx.Process(
                 target=_worker_main,
                 args=(wid, self.prob, self.make_sub, self.cfg, self.T,
-                      self.initial_state, initial, q, self._result_q),
+                      self.initial_state, initial, q, self._result_q,
+                      self._pool_version),
                 daemon=True)
             p.start()
             self._task_q.append(q)
@@ -348,6 +396,15 @@ class AsyncIterationEngine:
             self._view_uids.append({c.uid for lst in initial for c in lst})
             self._view_all.append({c.uid for lst in initial for c in lst})
             self._view_active.append({c.uid for lst in initial for c in lst})
+
+    def _block_size_now(self) -> int:
+        if not self._stage_block_adaptive:
+            return self._stage_block_static
+        elapsed = 0.0 if self._t0 is None else time.time() - self._t0
+        for i, sw in enumerate(self._stage_block_switch_s):
+            if elapsed < sw:
+                return int(self._stage_block_sizes[i])
+        return int(self._stage_block_sizes[-1])
 
     def _lift_now(self, k: int) -> bool:
         """本轮是否做增强割。
@@ -387,14 +444,16 @@ class AsyncIterationEngine:
         new_cuts, activate, deactivate = [], [], []
         for t in range(self.T + 2):
             pool = self.cut_pool.pools.get(t)
-            all_now = [] if pool is None else pool.all_cuts
             active_now = [] if pool is None else pool.active
             active_ids = {c.uid for c in active_now}
-            new = [c for c in all_now if c.uid not in seen_all]
+            # 只把“新且当前活跃”的割发给 worker；缓存中的非活跃割等复活时再发。
+            new = []
+            for c in active_now:
+                if c.uid not in seen_all:
+                    new.append(c)
+                    seen_all.add(c.uid)
             act = [c for c in active_now if c.uid not in seen_active]
             deact = [uid for uid in seen_active if uid not in active_ids]
-            for c in new:
-                seen_all.add(c.uid)
             for c in act:
                 seen_active.add(c.uid)
             for uid in deact:
@@ -411,7 +470,8 @@ class AsyncIterationEngine:
         else:
             new, deactivate = self._plain_delta(wid)
             activate = [[] for _ in range(self.T + 2)]
-        self._task_q[wid].put(("ack", new, activate, deactivate))
+        self._task_q[wid].put(
+            ("ack", new, activate, deactivate, int(self._pool_version.value)))
 
     def _dispatch(self, wid: int, k: int):
         if self.cut_pool is not None:
@@ -420,32 +480,40 @@ class AsyncIterationEngine:
         scene_paths = [self.rng.integers(0, self.n_scenes,
                                         size=self.T).tolist()
                        for _ in range(self.paths_per_task)]
+        blk = self._block_size_now()
+        self._iter_block[int(k)] = blk
         self._task_q[wid].put(
-            ("iter", k, scene_paths, deltas, deletions, self._lift_now(k)))
+            ("iter", k, scene_paths, deltas, deletions, self._lift_now(k),
+             blk, int(self._pool_version.value)))
 
     def _dispatch_julia(self, wid: int, k: int):
         new_cuts, activate, deactivate = self._julia_delta(wid)
         scene_paths = [self.rng.integers(0, self.n_scenes,
                                         size=self.T).tolist()
                        for _ in range(self.paths_per_task)]
+        blk = self._block_size_now()
+        self._iter_block[int(k)] = blk
         self._task_q[wid].put(
             ("iterj", k, scene_paths, new_cuts, activate, deactivate,
-             self._lift_now(k)))
+             self._lift_now(k), blk, int(self._pool_version.value)))
 
     def _merge(self, wid: int, new_cuts):
         if self.cut_pool is not None:
-            return self._merge_julia(wid, new_cuts)
-        # worker 已经把它自己生成的新割放进本地池；先记录 uid，再交给 LML1。
-        seen = self._view_uids[wid]
-        for t in range(self.T + 2):
-            if new_cuts[t]:
-                self.cuts[t].extend(new_cuts[t])
-                for c in new_cuts[t]:
-                    seen.add(c.uid)
-                if self.cut_selection == "lml1":
-                    self._lml1_update(
-                        t, [np.asarray(c.state, dtype=float)
-                            for c in new_cuts[t]], new_cuts[t])
+            self._merge_julia(wid, new_cuts)
+        else:
+            # worker 已经把它自己生成的新割放进本地池；先记录 uid，再交给 LML1。
+            seen = self._view_uids[wid]
+            for t in range(self.T + 2):
+                if new_cuts[t]:
+                    self.cuts[t].extend(new_cuts[t])
+                    for c in new_cuts[t]:
+                        seen.add(c.uid)
+                    if self.cut_selection == "lml1":
+                        self._lml1_update(
+                            t, [np.asarray(c.state, dtype=float)
+                                for c in new_cuts[t]], new_cuts[t])
+        if any(new_cuts[t] for t in range(self.T + 2)):
+            self._pool_version.value += 1
 
     def _merge_julia(self, wid: int, new_cuts):
         # 源 worker 自己把新割加入了本地活跃池；主进程随后按 Julia 规则筛选。
@@ -570,7 +638,13 @@ class AsyncIterationEngine:
                 "cut_selection": self.cut_selection,
                 "stage_block_size": int(getattr(
                     self.cfg, "stage_block_size", 0) or 0),
+                "stage_block_adaptive": self._stage_block_adaptive,
+                "stage_block_sizes": list(self._stage_block_sizes),
+                "stage_block_switch_s": list(self._stage_block_switch_s),
+                "block_hist": dict(self._block_hist),
                 "n_block_syncs": self.n_block_syncs,
+                "n_sync_skipped": self.n_sync_skipped,
+                "sync_wait_s": self.n_sync_wait_s,
                 "n_cut_dropped": self.n_cut_dropped,
                 "integer_mode": bool(getattr(self.cfg, "integer_enabled", False)),
                 "integer_scope": str(getattr(self.cfg, "integer_scope", "none")),
@@ -616,6 +690,7 @@ class AsyncIterationEngine:
         self._start_workers()
         history = []
         t0 = time.time()
+        self._t0 = t0
         last_ckpt = t0
         next_k = int(start_iter)
         last_k = int(start_iter) + int(n_iter) - 1
@@ -639,12 +714,17 @@ class AsyncIterationEngine:
                 outstanding -= 1
                 if kind == "err":
                     raise RuntimeError(f"async worker {wid} iter {k} failed:\n{rest[0]}")
-                if len(rest) >= 4:
+                if len(rest) >= 5:
+                    total, n_solves, new_cuts, lift_stats, sync_stats = rest[:5]
+                elif len(rest) >= 4:
                     total, n_solves, new_cuts, lift_stats = rest[:4]
+                    sync_stats = {}
                 else:
                     total, n_solves, new_cuts = rest[:3]
-                    lift_stats = {}
+                    lift_stats, sync_stats = {}, {}
                 self._merge(wid, new_cuts)
+                self.n_sync_wait_s += float(sync_stats.get("wait_s", 0.0))
+                self.n_sync_skipped += int(sync_stats.get("skipped", 0))
                 self.n_solves += int(n_solves)
                 self.n_iterations += 1
                 self.last_iter = max(self.last_iter, int(k))
@@ -661,11 +741,16 @@ class AsyncIterationEngine:
                                        else lb - self._last_lb)
                 self._last_lb = lb
                 elapsed = time.time() - t0
+                blk = self._iter_block.pop(int(k), self._block_size_now())
+                self._block_hist[str(blk)] = self._block_hist.get(str(blk), 0) + 1
                 rec = {"iter": int(k), "lb": lb, "sim": float(total),
                        "time": elapsed, "solves": self.n_solves,
                        "n_cuts": sum(len(c) for c in self.cuts[1:self.T + 1]),
                        "n_workers": self.n_workers,
                        "paths_per_task": self.paths_per_task,
+                       "block_size": int(blk),
+                       "sync_wait_s": float(sync_stats.get("wait_s", 0.0)),
+                       "sync_skipped": int(sync_stats.get("skipped", 0)),
                        "lift_used": bool(lift_used),
                        "lift_gain": lift_gain,
                        "lift_fallback": int(lift_stats.get("n_fb", 0))}
@@ -678,9 +763,10 @@ class AsyncIterationEngine:
                         lift_txt = (f" | lift={int(lift_used)}"
                                     f" gain={lift_gain:+.1f}"
                                     f" fb={rec['lift_fallback']}")
+                    blk_txt = f" | B={blk}" if self._stage_block_adaptive else ""
                     self.log(f"  async iter {k:5d} | LB={lb:14.4f} | "
                              f"sim={total:14.4f} | cuts={rec['n_cuts']:6d} | "
-                             f"{elapsed:7.1f} s{lift_txt}")
+                             f"{elapsed:7.1f} s{blk_txt}{lift_txt}")
                 ckpt_iv = float(getattr(self.cfg, "checkpoint_interval", 0) or 0)
                 if (self.results_dir is not None and ckpt_iv > 0
                         and time.time() - last_ckpt >= ckpt_iv):

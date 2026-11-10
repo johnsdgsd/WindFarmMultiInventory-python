@@ -375,6 +375,9 @@ class SolverConfig:
     cut_select_eps: float
     cut_select_keep_rounds: int
     stage_block_size: int
+    stage_block_adaptive: bool
+    stage_block_sizes: tuple[int, ...]
+    stage_block_switch_s: tuple[float, ...]
     integer: IntegerConfig
     importance_sampling: ImportanceSamplingConfig
     cut_lift: CutLiftConfig
@@ -453,6 +456,23 @@ class SolverConfig:
         if self.stage_block_size < 0:
             raise ValueError(f"[training] stage_block_size 不得为负（0 = 关闭），"
                              f"实际 {self.stage_block_size}")
+        if self.stage_block_adaptive:
+            if not self.stage_block_sizes:
+                raise ValueError(
+                    "[training] stage_block_adaptive=true 需要非空 stage_block_sizes")
+            if len(self.stage_block_switch_s) != len(self.stage_block_sizes) - 1:
+                raise ValueError(
+                    "[training] stage_block_switch_s 长度必须等于 "
+                    "stage_block_sizes 长度减 1")
+            if any(int(x) <= 0 for x in self.stage_block_sizes):
+                raise ValueError("[training] stage_block_sizes 必须全为正")
+            sw = [float(x) for x in self.stage_block_switch_s]
+            if any(sw[i] >= sw[i + 1] for i in range(len(sw) - 1)):
+                raise ValueError(
+                    "[training] stage_block_switch_s 必须严格递增")
+            if any(x <= 0 for x in sw):
+                raise ValueError(
+                    "[training] stage_block_switch_s 必须全为正")
         if self.max_train_seconds < 0:
             raise ValueError(f"[training] max_train_seconds 不得为负（0 = 不限），"
                              f"实际 {self.max_train_seconds}")
@@ -476,13 +496,27 @@ class SolverConfig:
             raise ValueError(f"[numerics] lb_time_limit 必须为正，"
                              f"实际 {self.lb_time_limit}")
 
+    def stage_block_desc(self) -> str:
+        if not self.stage_block_adaptive:
+            return str(self.stage_block_size or "off")
+        parts = []
+        t0 = 0.0
+        for i, b in enumerate(self.stage_block_sizes):
+            t1 = (self.stage_block_switch_s[i]
+                  if i < len(self.stage_block_switch_s) else None)
+            span = f"{t0:g}s+" if t1 is None else f"{t0:g}-{t1:g}s"
+            parts.append(f"{span}:B={b}")
+            if t1 is not None:
+                t0 = float(t1)
+        return "adaptive[" + ", ".join(parts) + "]"
+
     def describe(self) -> str:
         return "\n".join([
             f"训练   轮数 {self.iterations}  前向路径 {self.n_forward_paths}"
             f"（{self.forward_paths_per_process} × {self.n_processes} 进程）"
             f"  后向场景 {self.n_backward_samples or '全枚举'}"
             f"  割筛选 {self.cut_selection}"
-            f"  阶段块 {self.stage_block_size or 'off'}"
+            f"  阶段块 {self.stage_block_desc()}"
             f"  整数 {self.integer.describe()}"
             f"  重要性采样 {self.importance_sampling.describe()}"
             f"  割提升 {self.cut_lift.describe()}"
@@ -575,6 +609,12 @@ def load_solver_config(path, *, resolve: bool = True) -> SolverConfig:
         cut_select_keep_rounds=int(_req(tr, "cut_select_keep_rounds", "solver.toml/training")),
         stage_block_size=int(_opt(tr, "stage_block_size", 0,
                                   "solver.toml/training")),
+        stage_block_adaptive=bool(_opt(tr, "stage_block_adaptive", False,
+                                       "solver.toml/training")),
+        stage_block_sizes=tuple(int(x) for x in _opt(
+            tr, "stage_block_sizes", [], "solver.toml/training")),
+        stage_block_switch_s=tuple(float(x) for x in _opt(
+            tr, "stage_block_switch_s", [], "solver.toml/training")),
         integer=integer,
         importance_sampling=importance,
         cut_lift=cut_lift,
