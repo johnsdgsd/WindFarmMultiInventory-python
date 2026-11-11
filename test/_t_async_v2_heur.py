@@ -84,7 +84,8 @@ def main():
             f"time={h.get('sa_time_s', 0.0):.3f}s",
             f"qperturb    : perturbed={h.get('n_qp_perturbed', 0)} "
             f"base={h.get('n_qp_base', 0)} "
-            f"solves={h.get('n_qp_solves', 0)}",
+            f"solves={h.get('n_qp_solves', 0)} "
+            f"extra_trials={h.get('n_qp_extra_trials', 0)}",
             f"用时        : {time.time() - t0:.1f} s",
             "",
             "训练与仿真分离：UB/gap 需要另跑 simulate.py",

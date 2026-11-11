@@ -62,6 +62,7 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
     lift_margin = float(getattr(lcfg, "safety_margin", 1e-6))
     heur_on = bool(getattr(cfg, "forward_heuristic", False))
     heur_mode = str(getattr(cfg, "forward_heuristic_mode", "sa"))
+    heur_q_dual = bool(getattr(cfg, "heur_q_dual_trials", False))
     heur_lp_p0 = float(getattr(cfg, "heur_lp_p0", 0.5))
     heur_lp_p1 = float(getattr(cfg, "heur_lp_p1", 0.95))
     heur_ramp = int(getattr(cfg, "heur_ramp_iters", 1000))
@@ -76,6 +77,7 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
     qp_perturbed = 0
     qp_base = 0
     qp_solves = 0
+    qp_extra_trials = 0
     # 一个模型对应一个「未来割阶段」s：求解第 t=s−1 期时使用 cuts[s]。
     # s=1 由虚拟阶段 0 使用；s=2..T+1 是普通真实阶段模型（base 同 t=1）。
     cut_models = {}
@@ -220,6 +222,7 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
             qp_perturbed = 0
             qp_base = 0
             qp_solves = 0
+            qp_extra_trials = 0
 
             # 概率随轮次升高：LP 概率 p0→p1；其余走 SA/qperturb。
             k_ramp = min(max(int(round_id), 1), max(1, heur_ramp))
@@ -259,6 +262,12 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
                             if qr.perturbed:
                                 heur_used += 1
                                 qp_perturbed += 1
+                                # 主线继续扰动解；把 base 解作为额外的下一期试探点。
+                                if heur_q_dual and t < T:
+                                    trial[t + 1].append(
+                                        np.asarray(qr.base_x_out,
+                                                   dtype=float).copy())
+                                    qp_extra_trials += 1
                             else:
                                 qp_base += 1
                             continue
@@ -296,8 +305,10 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
                     or (lift_scope == "tail" and t > T - lift_last_k)
                     or (lift_scope == "selected" and t in lift_stages)))
                 stage_cuts = []
-                for k in range(K):
-                    xb = np.asarray(trial[t][k], dtype=float)
+                # 主线每路径一个点；qperturb dual 会在下一期追加 base 解。
+                for k, xb in enumerate(
+                        np.asarray(p, dtype=float) for p in trial[t]
+                        if p is not None):
                     sub.set_state(xb)
                     grads = np.empty((len(inds), prob.state_dim))
                     objs = np.empty(len(inds))
@@ -351,7 +362,8 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
                            "sa_accepted": sa_accepted,
                            "sa_time_s": sa_time_s,
                            "qp_perturbed": qp_perturbed,
-                           "qp_base": qp_base, "qp_solves": qp_solves}))
+                           "qp_base": qp_base, "qp_solves": qp_solves,
+                           "qp_extra_trials": qp_extra_trials}))
         except Exception:
             result_q.put(("err", wid, int(round_id), traceback.format_exc()))
 
@@ -453,6 +465,7 @@ class AsyncIterationEngine:
         self.n_qp_perturbed = 0
         self.n_qp_base = 0
         self.n_qp_solves = 0
+        self.n_qp_extra_trials = 0
         self._proc = []
         # 每个 worker 已持有的割 uid。不能用「全局前缀长度」，因为不同 worker 的
         # 完成顺序会让全局列表的追加顺序与本 worker 的本地顺序不同。
@@ -752,9 +765,12 @@ class AsyncIterationEngine:
                     "n_sa_moves": self.n_sa_moves,
                     "n_sa_accepted": self.n_sa_accepted,
                     "sa_time_s": self.sa_time_s,
+                    "q_dual_trials": bool(getattr(
+                        self.cfg, "heur_q_dual_trials", False)),
                     "n_qp_perturbed": self.n_qp_perturbed,
                     "n_qp_base": self.n_qp_base,
                     "n_qp_solves": self.n_qp_solves,
+                    "n_qp_extra_trials": self.n_qp_extra_trials,
                 },
                 "n_cut_dropped": self.n_cut_dropped,
                 "integer_mode": bool(getattr(self.cfg, "integer_enabled", False)),
@@ -849,6 +865,8 @@ class AsyncIterationEngine:
                 self.n_qp_perturbed += int(heur_stats.get("qp_perturbed", 0))
                 self.n_qp_base += int(heur_stats.get("qp_base", 0))
                 self.n_qp_solves += int(heur_stats.get("qp_solves", 0))
+                self.n_qp_extra_trials += int(
+                    heur_stats.get("qp_extra_trials", 0))
                 self.n_solves += int(n_solves)
                 self.n_iterations += 1
                 self.last_iter = max(self.last_iter, int(k))

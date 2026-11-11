@@ -43,6 +43,7 @@ def qperturb_step(sub, x, scene, *, rng=None) -> QPerturbResult:
         rng = np.random.default_rng(20261111)
     q_prob = float(getattr(cfg, "heur_q_prob", 0.5))
     q_step = float(getattr(cfg, "heur_q_step", 1.0))
+    resolve_prob = float(getattr(cfg, "heur_q_resolve_prob", 1.0))
     integer = bool(getattr(cfg, "integer_enabled", False))
     if q_step <= 0:
         raise ValueError(f"heur_q_step 非法：{q_step}")
@@ -57,6 +58,11 @@ def qperturb_step(sub, x, scene, *, rng=None) -> QPerturbResult:
     base_obj = float(sub.obj)
     base_dec = sub.decision_values()
     q_base = np.asarray(base_dec["q"], dtype=float).copy()
+    # 按概率跳过扰动：直接使用 base 最优解，不再重解。
+    if resolve_prob <= 0.0 or rng.random() >= resolve_prob:
+        return QPerturbResult(base_x, base_cost, base_obj, base_x, base_cost,
+                              base_obj, q_base, q_base.copy(), False, False,
+                              n_solves, base_dec)
     if q_prob <= 0.0:
         return QPerturbResult(base_x, base_cost, base_obj, base_x, base_cost,
                               base_obj, q_base, q_base.copy(), False, False,

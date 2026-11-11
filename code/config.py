@@ -389,6 +389,8 @@ class SolverConfig:
     heur_sa_step: float
     heur_q_prob: float
     heur_q_step: float
+    heur_q_resolve_prob: float
+    heur_q_dual_trials: bool
     stage_block_sizes: tuple[int, ...]
     stage_block_switch_s: tuple[float, ...]
     integer: IntegerConfig
@@ -493,6 +495,8 @@ class SolverConfig:
             raise ValueError("[training] heur_q_prob 必须在 [0,1]")
         if self.heur_q_step <= 0:
             raise ValueError("[training] heur_q_step 必须为正")
+        if not (0.0 <= self.heur_q_resolve_prob <= 1.0):
+            raise ValueError("[training] heur_q_resolve_prob 必须在 [0,1]")
         if self.stage_block_adaptive:
             if not self.stage_block_sizes:
                 raise ValueError(
@@ -673,6 +677,10 @@ def load_solver_config(path, *, resolve: bool = True) -> SolverConfig:
                                "solver.toml/training")),
         heur_q_step=float(_opt(tr, "heur_q_step", 1.0,
                                "solver.toml/training")),
+        heur_q_resolve_prob=float(_opt(
+            tr, "heur_q_resolve_prob", 1.0, "solver.toml/training")),
+        heur_q_dual_trials=bool(_opt(tr, "heur_q_dual_trials", False,
+                                     "solver.toml/training")),
         stage_block_sizes=tuple(int(x) for x in _opt(
             tr, "stage_block_sizes", [], "solver.toml/training")),
         stage_block_switch_s=tuple(float(x) for x in _opt(
