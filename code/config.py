@@ -391,6 +391,10 @@ class SolverConfig:
     heur_q_step: float
     heur_q_resolve_prob: float
     heur_q_dual_trials: bool
+    replay_enabled: bool
+    replay_every: int
+    replay_prob: float
+    replay_points: int
     stage_block_sizes: tuple[int, ...]
     stage_block_switch_s: tuple[float, ...]
     integer: IntegerConfig
@@ -497,6 +501,12 @@ class SolverConfig:
             raise ValueError("[training] heur_q_step 必须为正")
         if not (0.0 <= self.heur_q_resolve_prob <= 1.0):
             raise ValueError("[training] heur_q_resolve_prob 必须在 [0,1]")
+        if self.replay_every < 0:
+            raise ValueError("[training] replay_every 不得为负")
+        if not (0.0 <= self.replay_prob <= 1.0):
+            raise ValueError("[training] replay_prob 必须在 [0,1]")
+        if self.replay_points < 1:
+            raise ValueError("[training] replay_points 必须 ≥ 1")
         if self.stage_block_adaptive:
             if not self.stage_block_sizes:
                 raise ValueError(
@@ -560,7 +570,11 @@ class SolverConfig:
             f"  阶段块 {self.stage_block_desc()}"
             f"  整数 {self.integer.describe()}"
             f"  前向启发式 {'on:' + self.forward_heuristic_mode if self.forward_heuristic else 'off'}"
-            f"  重要性采样 {self.importance_sampling.describe()}"
+            f"  经验回放 "
+            + (f"on e={self.replay_every or 'prob'} "
+               f"p={self.replay_prob:g} n={self.replay_points}"
+               if self.replay_enabled else "off")
+            + f"  重要性采样 {self.importance_sampling.describe()}"
             f"  割提升 {self.cut_lift.describe()}"
             f"  时限 {self.max_train_seconds or '不限'} s",
             f"并行   进程 {self.n_processes}  每进程 COPT 线程 {self.threads_per_process}",
@@ -681,6 +695,14 @@ def load_solver_config(path, *, resolve: bool = True) -> SolverConfig:
             tr, "heur_q_resolve_prob", 1.0, "solver.toml/training")),
         heur_q_dual_trials=bool(_opt(tr, "heur_q_dual_trials", False,
                                      "solver.toml/training")),
+        replay_enabled=bool(_opt(tr, "replay_enabled", False,
+                                 "solver.toml/training")),
+        replay_every=int(_opt(tr, "replay_every", 0,
+                              "solver.toml/training")),
+        replay_prob=float(_opt(tr, "replay_prob", 0.0,
+                               "solver.toml/training")),
+        replay_points=int(_opt(tr, "replay_points", 5,
+                               "solver.toml/training")),
         stage_block_sizes=tuple(int(x) for x in _opt(
             tr, "stage_block_sizes", [], "solver.toml/training")),
         stage_block_switch_s=tuple(float(x) for x in _opt(

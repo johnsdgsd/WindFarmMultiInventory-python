@@ -1,0 +1,44 @@
+# 冒烟配置：V2 连续 + SA 前向启发式。
+[training]
+iterations = 10
+forward_paths_per_process = 1
+n_backward_samples = 0
+checkpoint_interval = 600.0
+max_train_seconds = 0
+cut_selection = "julia"
+cut_select_eps = 1e-6
+cut_select_keep_rounds = 0
+stage_block_size = 2
+forward_heuristic = true
+forward_heuristic_mode = "qperturb"
+heur_lp_p0 = 0.2
+heur_lp_p1 = 0.95
+heur_ramp_iters = 1000
+heur_alpha = 1.0
+heur_q_prob = 0.5
+heur_q_step = 1.0
+heur_q_resolve_prob = 0.5
+replay_enabled = true
+replay_every = 5
+replay_points = 2
+seed = 2026
+
+[parallel]
+n_processes = 2
+threads_per_process = 1
+
+[simulation]
+n_simulations = 20
+chunk_size = 10
+
+[numerics]
+feas_tol = 1e-6
+dual_tol = 1e-6
+int_tol = 1e-6
+presolve = -1
+mip_rel_gap = 0.001
+mip_time_limit = 20.0
+
+[output]
+tag = "smoke_qp_mix_replay"
+results_root = "results"

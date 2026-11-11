@@ -63,6 +63,11 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
     heur_on = bool(getattr(cfg, "forward_heuristic", False))
     heur_mode = str(getattr(cfg, "forward_heuristic_mode", "sa"))
     heur_q_dual = bool(getattr(cfg, "heur_q_dual_trials", False))
+    replay_on = bool(getattr(cfg, "replay_enabled", False))
+    replay_every = int(getattr(cfg, "replay_every", 0))
+    replay_prob = float(getattr(cfg, "replay_prob", 0.0))
+    replay_points = int(getattr(cfg, "replay_points", 5))
+    replay_rng = np.random.default_rng(int(cfg.seed) + wid * 104729)
     heur_lp_p0 = float(getattr(cfg, "heur_lp_p0", 0.5))
     heur_lp_p1 = float(getattr(cfg, "heur_lp_p1", 0.95))
     heur_ramp = int(getattr(cfg, "heur_ramp_iters", 1000))
@@ -78,6 +83,11 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
     qp_base = 0
     qp_solves = 0
     qp_extra_trials = 0
+    rp_triggers = 0
+    rp_points = 0
+    rp_cuts = 0
+    rp_solves = 0
+    rp_fail = 0
     # 一个模型对应一个「未来割阶段」s：求解第 t=s−1 期时使用 cuts[s]。
     # s=1 由虚拟阶段 0 使用；s=2..T+1 是普通真实阶段模型（base 同 t=1）。
     cut_models = {}
@@ -223,6 +233,11 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
             qp_base = 0
             qp_solves = 0
             qp_extra_trials = 0
+            rp_triggers = 0
+            rp_points = 0
+            rp_cuts = 0
+            rp_solves = 0
+            rp_fail = 0
 
             # 概率随轮次升高：LP 概率 p0→p1；其余走 SA/qperturb。
             k_ramp = min(max(int(round_id), 1), max(1, heur_ramp))
@@ -353,6 +368,60 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
                         and (T - t + 1) % block_size == 0):
                     sync_block(round_id, new_cuts, force=True)
                     new_cuts = [[] for _ in range(T + 2)]
+
+            # 经验回放：抽样历史 Cut 的锚点状态，用当前 cuts[t+1] 重解生成新割。
+            do_replay = bool(
+                replay_on and (
+                    (replay_every > 0
+                     and int(round_id) % replay_every == 0)
+                    or (replay_every == 0 and replay_prob > 0.0
+                        and replay_rng.random() < replay_prob)))
+            if do_replay:
+                rp_triggers += 1
+                cands, seen = [], set()
+                for s in range(1, T + 1):
+                    for c in all_cuts[s].values():
+                        if getattr(c, "it", 0) >= int(round_id):
+                            continue
+                        st = getattr(c, "state", None)
+                        if st is None:
+                            continue
+                        arr = np.asarray(st, dtype=float).ravel()
+                        key = (s, tuple(np.round(arr, 6)))
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        cands.append((s, arr.copy()))
+                n_rp = min(replay_points, len(cands))
+                if n_rp > 0:
+                    pick = replay_rng.choice(len(cands), size=n_rp,
+                                             replace=False)
+                    for ri, idx in enumerate(pick):
+                        s, xb = cands[int(idx)]
+                        try:
+                            sub = cut_model(s + 1)
+                            sub.set_state(xb)
+                            grads = np.empty((len(inds), prob.state_dim))
+                            objs = np.empty(len(inds))
+                            for j, si in enumerate(inds):
+                                sub.set_scene(prob.pool[si])
+                                sub.solve_lp()
+                                n_solves += 1
+                                rp_solves += 1
+                                grads[j] = np.asarray(
+                                    sub.gradient("dj"), dtype=float)
+                                objs[j] = float(sub.obj)
+                            beta = grads.mean(axis=0)
+                            obj = float(objs.mean())
+                            c = Cut(float(obj) - float(beta @ xb), beta, xb,
+                                    s, obj, int(round_id))
+                            c.uid = ("rp", wid, int(round_id), s, ri)
+                            add_cut(s, c)
+                            new_cuts[s].append(c)
+                            rp_points += 1
+                            rp_cuts += 1
+                        except Exception:
+                            rp_fail += 1
             result_q.put(("ok", wid, int(round_id), float(totals.mean()),
                           n_solves, new_cuts, lift_stats,
                           {"calls": sync_calls, "skipped": sync_skipped,
@@ -363,7 +432,10 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
                            "sa_time_s": sa_time_s,
                            "qp_perturbed": qp_perturbed,
                            "qp_base": qp_base, "qp_solves": qp_solves,
-                           "qp_extra_trials": qp_extra_trials}))
+                           "qp_extra_trials": qp_extra_trials,
+                           "rp_triggers": rp_triggers,
+                           "rp_points": rp_points, "rp_cuts": rp_cuts,
+                           "rp_solves": rp_solves, "rp_fail": rp_fail}))
         except Exception:
             result_q.put(("err", wid, int(round_id), traceback.format_exc()))
 
@@ -466,6 +538,11 @@ class AsyncIterationEngine:
         self.n_qp_base = 0
         self.n_qp_solves = 0
         self.n_qp_extra_trials = 0
+        self.n_rp_triggers = 0
+        self.n_rp_points = 0
+        self.n_rp_cuts = 0
+        self.n_rp_solves = 0
+        self.n_rp_fail = 0
         self._proc = []
         # 每个 worker 已持有的割 uid。不能用「全局前缀长度」，因为不同 worker 的
         # 完成顺序会让全局列表的追加顺序与本 worker 的本地顺序不同。
@@ -772,6 +849,18 @@ class AsyncIterationEngine:
                     "n_qp_solves": self.n_qp_solves,
                     "n_qp_extra_trials": self.n_qp_extra_trials,
                 },
+                "experience_replay": {
+                    "enabled": bool(getattr(
+                        self.cfg, "replay_enabled", False)),
+                    "every": int(getattr(self.cfg, "replay_every", 0)),
+                    "prob": float(getattr(self.cfg, "replay_prob", 0.0)),
+                    "points": int(getattr(self.cfg, "replay_points", 5)),
+                    "n_triggers": self.n_rp_triggers,
+                    "n_points": self.n_rp_points,
+                    "n_cuts": self.n_rp_cuts,
+                    "n_solves": self.n_rp_solves,
+                    "n_fail": self.n_rp_fail,
+                },
                 "n_cut_dropped": self.n_cut_dropped,
                 "integer_mode": bool(getattr(self.cfg, "integer_enabled", False)),
                 "integer_scope": str(getattr(self.cfg, "integer_scope", "none")),
@@ -867,6 +956,11 @@ class AsyncIterationEngine:
                 self.n_qp_solves += int(heur_stats.get("qp_solves", 0))
                 self.n_qp_extra_trials += int(
                     heur_stats.get("qp_extra_trials", 0))
+                self.n_rp_triggers += int(heur_stats.get("rp_triggers", 0))
+                self.n_rp_points += int(heur_stats.get("rp_points", 0))
+                self.n_rp_cuts += int(heur_stats.get("rp_cuts", 0))
+                self.n_rp_solves += int(heur_stats.get("rp_solves", 0))
+                self.n_rp_fail += int(heur_stats.get("rp_fail", 0))
                 self.n_solves += int(n_solves)
                 self.n_iterations += 1
                 self.last_iter = max(self.last_iter, int(k))

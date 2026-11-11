@@ -86,6 +86,10 @@ def main():
             f"base={h.get('n_qp_base', 0)} "
             f"solves={h.get('n_qp_solves', 0)} "
             f"extra_trials={h.get('n_qp_extra_trials', 0)}",
+            f"经验回放    : triggers={meta.get('experience_replay', {}).get('n_triggers', 0)} "
+            f"cuts={meta.get('experience_replay', {}).get('n_cuts', 0)} "
+            f"solves={meta.get('experience_replay', {}).get('n_solves', 0)} "
+            f"fail={meta.get('experience_replay', {}).get('n_fail', 0)}",
             f"用时        : {time.time() - t0:.1f} s",
             "",
             "训练与仿真分离：UB/gap 需要另跑 simulate.py",
