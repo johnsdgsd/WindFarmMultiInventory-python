@@ -378,6 +378,8 @@ class SolverConfig:
     stage_block_adaptive: bool
     stage_block_sizes: tuple[int, ...]
     stage_block_switch_s: tuple[float, ...]
+    shared_cut_pool: bool
+    shared_poll_every: int
     integer: IntegerConfig
     importance_sampling: ImportanceSamplingConfig
     cut_lift: CutLiftConfig
@@ -456,6 +458,9 @@ class SolverConfig:
         if self.stage_block_size < 0:
             raise ValueError(f"[training] stage_block_size 不得为负（0 = 关闭），"
                              f"实际 {self.stage_block_size}")
+        if self.shared_poll_every < 1:
+            raise ValueError(f"[training] shared_poll_every 必须 ≥ 1，"
+                             f"实际 {self.shared_poll_every}")
         if self.stage_block_adaptive:
             if not self.stage_block_sizes:
                 raise ValueError(
@@ -517,7 +522,8 @@ class SolverConfig:
             f"  后向场景 {self.n_backward_samples or '全枚举'}"
             f"  割筛选 {self.cut_selection}"
             f"  阶段块 {self.stage_block_desc()}"
-            f"  整数 {self.integer.describe()}"
+            + ("  共享割池" if self.shared_cut_pool else "")
+            + f"  整数 {self.integer.describe()}"
             f"  重要性采样 {self.importance_sampling.describe()}"
             f"  割提升 {self.cut_lift.describe()}"
             f"  时限 {self.max_train_seconds or '不限'} s",
@@ -615,6 +621,10 @@ def load_solver_config(path, *, resolve: bool = True) -> SolverConfig:
             tr, "stage_block_sizes", [], "solver.toml/training")),
         stage_block_switch_s=tuple(float(x) for x in _opt(
             tr, "stage_block_switch_s", [], "solver.toml/training")),
+        shared_cut_pool=bool(_opt(tr, "shared_cut_pool", False,
+                                  "solver.toml/training")),
+        shared_poll_every=int(_opt(tr, "shared_poll_every", 1,
+                                   "solver.toml/training")),
         integer=integer,
         importance_sampling=importance,
         cut_lift=cut_lift,

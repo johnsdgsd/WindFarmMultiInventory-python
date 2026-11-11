@@ -13,15 +13,31 @@
 """
 from __future__ import annotations
 
+import hashlib
 import multiprocessing as mp
 import traceback
 import time
+from multiprocessing import shared_memory
 from pathlib import Path
 
 import numpy as np
 
 from .cut import Cut, pack, trivial_cut
 from .cut_pool import CutPool
+
+
+def _cut_key(uid) -> int:
+    """跨进程稳定的 64 位割标识。"""
+    raw = repr(uid).encode("utf-8", errors="replace")
+    return int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(),
+                          "little", signed=True)
+
+
+def _shared_layout(dim: int):
+    return np.dtype([
+        ("action", "u1"), ("stage", "i4"), ("key", "i8"),
+        ("alpha", "f8"), ("beta", "f8", (int(dim),)),
+    ])
 
 
 def _solve_forward(sub, cfg):
@@ -41,13 +57,27 @@ def _scene_indices(cfg, round_id: int, n_scenes: int):
 
 
 def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
-                 task_q, result_q, pool_version):
+                 task_q, result_q, pool_version,
+                 shared_name, shared_max, shared_count):
     cuts = [list(c) for c in initial_cuts]
     # 所有发现过的割都缓存；cuts[s] 只是当前进入 LP 的活跃割。
     all_cuts = [{getattr(c, "uid", None): c for c in cuts[s]}
                 for s in range(T + 2)]
     active_uids = [{getattr(c, "uid", None) for c in cuts[s]}
                    for s in range(T + 2)]
+    shared_enabled = shared_name is not None
+    shm = None
+    shm_arr = None
+    shared_read = 0
+    shared_applied = 0
+    shared_polls = 0
+    shared_syncs = 0
+    shared_poll_every = max(1, int(getattr(cfg, "shared_poll_every", 1)))
+    if shared_enabled:
+        shm = shared_memory.SharedMemory(name=shared_name)
+        shm_arr = np.ndarray((int(shared_max),),
+                             dtype=_shared_layout(prob.state_dim),
+                             buffer=shm.buf)
     # cut_lift 与割池正交：这里只改变后向生成的割，不改变池的选择规则。
     lift_enabled = bool(getattr(cfg, "cut_lift_enabled", False))
     lcfg = getattr(cfg, "cut_lift", None)
@@ -109,6 +139,47 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
             if sub is not None:
                 sub.append_cuts([c])
 
+    def apply_shared():
+        """非阻塞读取全局割池事件；不经过主进程 ack。"""
+        nonlocal shared_read, shared_applied, shared_polls
+        if not shared_enabled:
+            return
+        shared_polls += 1
+        head = int(shared_count.value)
+        if head <= shared_read:
+            return
+        start = max(shared_read, head - int(shared_max))
+        shared_applied += head - start
+        for idx in range(start, head):
+            rec = shm_arr[idx % int(shared_max)]
+            stage = int(rec["stage"])
+            key = int(rec["key"])
+            action = int(rec["action"])
+            if not (1 <= stage <= T):
+                continue
+            if action == 0:
+                if key in active_uids[stage]:
+                    continue
+                if key in all_cuts[stage]:
+                    # 已有缓存但未激活：直接激活，避免重复构造/更新。
+                    c = all_cuts[stage][key]
+                    cuts[stage].append(c)
+                    active_uids[stage].add(key)
+                    sub = cut_models.get(stage)
+                    if sub is not None:
+                        sub.append_cuts([c])
+                    continue
+                beta = np.array(rec["beta"], dtype=float)
+                c = Cut(float(rec["alpha"]), beta,
+                        np.zeros(prob.state_dim, dtype=float), stage,
+                        float(rec["alpha"]), 0)
+                c.uid = key
+                add_cut(stage, c)
+            elif action == 1:
+                if key in active_uids[stage]:
+                    deactivate(stage, [key])
+        shared_read = head
+
     local_version = 0
     sync_calls = 0
     sync_skipped = 0
@@ -132,9 +203,16 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
 
         force=False 时，如果全局版本没变且没有新割，就跳过这次往返。
         """
-        nonlocal sync_calls, sync_skipped, sync_wait_s
-        if (not force and not any(new_cuts)
-                and int(pool_version.value) == local_version):
+        nonlocal sync_calls, sync_skipped, sync_wait_s, shared_syncs
+        if shared_enabled:
+            shared_syncs += 1
+            if force or shared_syncs % shared_poll_every == 0:
+                apply_shared()
+            if not force and not any(new_cuts):
+                sync_skipped += 1
+                return
+        elif (not force and not any(new_cuts)
+              and int(pool_version.value) == local_version):
             sync_skipped += 1
             return
         sync_calls += 1
@@ -147,6 +225,7 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
         if ack[0] != "ack":
             raise RuntimeError(f"worker expected ack, got {ack[0]!r}")
         apply_ack(ack)
+        apply_shared()
 
     default_block_size = int(getattr(cfg, "stage_block_size", 0) or 0)
 
@@ -187,6 +266,7 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
             continue
         if task_version is not None:
             local_version = task_version
+        apply_shared()
         lift_this = bool(lift_this and lift_enabled)
         try:
             x0 = np.asarray(initial_state, dtype=float).copy()
@@ -263,7 +343,9 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
                         obj = obj_lp
                     c = Cut(float(obj) - float(beta @ xb), beta, xb, t, obj,
                             int(round_id))
-                    c.uid = ("w", wid, int(round_id), t, k)
+                    c.uid = (_cut_key(("w", wid, int(round_id), t, k))
+                             if shared_enabled
+                             else ("w", wid, int(round_id), t, k))
                     stage_cuts.append(c)
                 # 割阶段 t 的模型 v=t 只服务第 t−1 期；当前后向正在用 t+1。
                 for c in stage_cuts:
@@ -276,7 +358,10 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
             result_q.put(("ok", wid, int(round_id), float(totals.mean()),
                           n_solves, new_cuts, lift_stats,
                           {"calls": sync_calls, "skipped": sync_skipped,
-                           "wait_s": sync_wait_s}))
+                           "wait_s": sync_wait_s,
+                           "shared_read": shared_read,
+                           "shared_applied": shared_applied,
+                           "shared_polls": shared_polls}))
         except Exception:
             result_q.put(("err", wid, int(round_id), traceback.format_exc()))
 
@@ -307,10 +392,14 @@ class AsyncIterationEngine:
         self.log = log if log is not None else (lambda *a, **k: None)
         self.rng = np.random.default_rng(int(cfg.seed))
         self.n_scenes = len(prob.pool)
+        self.shared_cut_pool = bool(getattr(cfg, "shared_cut_pool", False))
+        if self.shared_cut_pool and self.cut_selection != "julia":
+            raise ValueError("shared_cut_pool 目前只支持 cut_selection='julia'")
         self.cuts = [[] for _ in range(self.T + 2)]
         for t in range(1, self.T + 1):
             c = trivial_cut(t, self.initial_state, self.state_dim)
-            c.uid = ("init", t, 0)
+            c.uid = (_cut_key(("init", t, 0))
+                     if self.shared_cut_pool else ("init", t, 0))
             self.cuts[t].append(c)
         self.cut_pool = None
         self.cut_deletion_minimum = int(getattr(cfg, "cut_deletion_minimum", 1))
@@ -367,6 +456,23 @@ class AsyncIterationEngine:
         self._task_q = []
         self._result_q = self._ctx.Queue()
         self._pool_version = self._ctx.Value("q", 0)
+        self._shm = None
+        self._shm_arr = None
+        self._shm_count = None
+        self._shm_max = 200000
+        if self.shared_cut_pool:
+            self._shm_dtype = _shared_layout(self.state_dim)
+            self._shm = shared_memory.SharedMemory(
+                create=True, size=self._shm_max * self._shm_dtype.itemsize)
+            self._shm_arr = np.ndarray(
+                (self._shm_max,), dtype=self._shm_dtype, buffer=self._shm.buf)
+            self._shm_count = self._ctx.Value("q", 0)
+            self._shm_name = self._shm.name
+        else:
+            self._shm_name = None
+        self.n_shared_events = 0
+        self.n_shared_applied = 0
+        self.n_shared_polls = 0
         self.n_sync_wait_s = 0.0
         self.n_sync_skipped = 0
         self._proc = []
@@ -388,7 +494,8 @@ class AsyncIterationEngine:
                 target=_worker_main,
                 args=(wid, self.prob, self.make_sub, self.cfg, self.T,
                       self.initial_state, initial, q, self._result_q,
-                      self._pool_version),
+                      self._pool_version, self._shm_name, self._shm_max,
+                      self._shm_count),
                 daemon=True)
             p.start()
             self._task_q.append(q)
@@ -497,9 +604,27 @@ class AsyncIterationEngine:
             ("iterj", k, scene_paths, new_cuts, activate, deactivate,
              self._lift_now(k), blk, int(self._pool_version.value)))
 
+    def _publish_shared(self, events) -> None:
+        if not self.shared_cut_pool or not events:
+            return
+        for action, stage, cut in events:
+            idx = int(self._shm_count.value)
+            rec = self._shm_arr[idx % self._shm_max]
+            rec["action"] = int(action)
+            rec["stage"] = int(stage)
+            rec["key"] = int(cut.uid)
+            rec["alpha"] = float(cut.alpha) if action == 0 else 0.0
+            if action == 0:
+                rec["beta"][:] = cut.beta
+            else:
+                rec["beta"][:] = 0.0
+            self._shm_count.value = idx + 1
+            self.n_shared_events += 1
+
     def _merge(self, wid: int, new_cuts):
+        events = []
         if self.cut_pool is not None:
-            self._merge_julia(wid, new_cuts)
+            events = self._merge_julia(wid, new_cuts)
         else:
             # worker 已经把它自己生成的新割放进本地池；先记录 uid，再交给 LML1。
             seen = self._view_uids[wid]
@@ -512,6 +637,7 @@ class AsyncIterationEngine:
                         self._lml1_update(
                             t, [np.asarray(c.state, dtype=float)
                                 for c in new_cuts[t]], new_cuts[t])
+        self._publish_shared(events)
         if any(new_cuts[t] for t in range(self.T + 2)):
             self._pool_version.value += 1
 
@@ -519,6 +645,7 @@ class AsyncIterationEngine:
         # 源 worker 自己把新割加入了本地活跃池；主进程随后按 Julia 规则筛选。
         seen_all = self._view_all[wid]
         seen_active = self._view_active[wid]
+        events = []
         for t in range(self.T + 2):
             for c in new_cuts[t]:
                 seen_all.add(c.uid)
@@ -526,9 +653,14 @@ class AsyncIterationEngine:
             if t == 0 or t > self.T:
                 continue
             for c in new_cuts[t]:
-                _, deactivated = self.cut_pool.add(t, c)
+                activated, deactivated = self.cut_pool.add(t, c)
+                for x in activated:
+                    events.append((0, t, x))
+                # v2：共享内存只广播新增/复活的 active 割。
+                # deactivation 仍走原有的定向 ack，避免全局失活事件风暴。
                 self.n_cut_dropped += len(deactivated)
             self.cuts[t] = self.cut_pool.active(t)
+        return events
 
     def restore_cut_pool(self) -> int:
         """resume 后把已加载的活跃割装入 Julia 式缓存池。"""
@@ -553,6 +685,11 @@ class AsyncIterationEngine:
         self.cuts = [[] for _ in range(self.T + 2)]
         for t in range(1, self.T + 1):
             self.cuts[t] = list(cuts_by_stage[t])
+            if self.shared_cut_pool:
+                for i, c in enumerate(self.cuts[t]):
+                    base = c.uid if getattr(c, "uid", None) is not None else (
+                        "seed", t, i)
+                    c.uid = _cut_key(base)
         self.cut_pool = None
         if self.cut_selection == "julia":
             self.cut_pool = CutPool(self.T + 1, self.cut_deletion_minimum)
@@ -639,6 +776,10 @@ class AsyncIterationEngine:
                 "stage_block_size": int(getattr(
                     self.cfg, "stage_block_size", 0) or 0),
                 "stage_block_adaptive": self._stage_block_adaptive,
+                "shared_cut_pool": self.shared_cut_pool,
+                "n_shared_events": self.n_shared_events,
+                "n_shared_applied": self.n_shared_applied,
+                "n_shared_polls": self.n_shared_polls,
                 "stage_block_sizes": list(self._stage_block_sizes),
                 "stage_block_switch_s": list(self._stage_block_switch_s),
                 "block_hist": dict(self._block_hist),
@@ -725,6 +866,8 @@ class AsyncIterationEngine:
                 self._merge(wid, new_cuts)
                 self.n_sync_wait_s += float(sync_stats.get("wait_s", 0.0))
                 self.n_sync_skipped += int(sync_stats.get("skipped", 0))
+                self.n_shared_applied += int(sync_stats.get("shared_applied", 0))
+                self.n_shared_polls += int(sync_stats.get("shared_polls", 0))
                 self.n_solves += int(n_solves)
                 self.n_iterations += 1
                 self.last_iter = max(self.last_iter, int(k))
@@ -820,4 +963,14 @@ class AsyncIterationEngine:
             if p.is_alive():
                 p.terminate()
             p.join(timeout=2)
+        if self._shm is not None:
+            try:
+                self._shm.close()
+            finally:
+                try:
+                    self._shm.unlink()
+                except FileNotFoundError:
+                    pass
+            self._shm = None
+            self._shm_arr = None
         self._closed = True
