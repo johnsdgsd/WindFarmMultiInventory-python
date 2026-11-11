@@ -60,6 +60,18 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
     lift_rel = float(getattr(lcfg, "rel_gap", 0.0))
     lift_abs = float(getattr(lcfg, "abs_gap", 0.0))
     lift_margin = float(getattr(lcfg, "safety_margin", 1e-6))
+    heur_on = bool(getattr(cfg, "forward_heuristic", False))
+    heur_lp_p0 = float(getattr(cfg, "heur_lp_p0", 0.5))
+    heur_lp_p1 = float(getattr(cfg, "heur_lp_p1", 0.95))
+    heur_ramp = int(getattr(cfg, "heur_ramp_iters", 1000))
+    heur_alpha = float(getattr(cfg, "heur_alpha", 1.0))
+    heur_rng = np.random.default_rng(int(cfg.seed) + wid * 7919)
+    heur_trials = 0
+    heur_used = 0
+    heur_fail = 0
+    sa_moves = 0
+    sa_accepted = 0
+    sa_time_s = 0.0
     # 一个模型对应一个「未来割阶段」s：求解第 t=s−1 期时使用 cuts[s]。
     # s=1 由虚拟阶段 0 使用；s=2..T+1 是普通真实阶段模型（base 同 t=1）。
     cut_models = {}
@@ -195,6 +207,17 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
             trial = [[None] * K for _ in range(T + 1)]
             totals = np.zeros(K)
             n_solves = 0
+            heur_trials = 0
+            heur_used = 0
+            heur_fail = 0
+            sa_moves = 0
+            sa_accepted = 0
+            sa_time_s = 0.0
+
+            # 概率随轮次升高：LP 概率 p0→p1；其余走 SA 前向启发式。
+            k_ramp = min(max(int(round_id), 1), max(1, heur_ramp))
+            lp_prob = (heur_lp_p0 + (heur_lp_p1 - heur_lp_p0)
+                       * (k_ramp / max(1, heur_ramp)) ** heur_alpha)
 
             # forward：同一切割快照下顺序走 K 条路径
             for k, scene_path in enumerate(scene_paths):
@@ -206,14 +229,35 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
                     sub = cut_model(t + 1)
                     if t == 0:
                         sub.set_state(x)
-                    else:
-                        trial[t][k] = x.copy()
-                        sub.set_point(x, prob.pool[int(scene_path[t - 1])])
+                        _solve_forward(sub, cfg)
+                        n_solves += 1
+                        x = sub.out_state_vector()
+                        continue
+
+                    trial[t][k] = x.copy()
+                    scene = prob.pool[int(scene_path[t - 1])]
+                    use_heur = heur_on and heur_rng.random() >= lp_prob
+                    if use_heur:
+                        heur_trials += 1
+                        h = sub.heuristic_step(
+                            x, scene, stage_t=t,
+                            cuts_next=cuts[t + 1], rng=heur_rng)
+                        if h is not None:
+                            heur_used += 1
+                            sa_moves += int(h.sa_moves)
+                            sa_accepted += int(h.sa_accepted)
+                            sa_time_s += float(h.sa_time_s)
+                            x = h.x_out
+                            totals[k] += float(h.stage_cost)
+                            continue
+                        # 仅预期不可行才回退到原有 LP/MIP。
+                        heur_fail += 1
+
+                    sub.set_point(x, scene)
                     _solve_forward(sub, cfg)
                     n_solves += 1
                     x = sub.out_state_vector()
-                    if t >= 1:
-                        totals[k] += float(sub.stage_cost())
+                    totals[k] += float(sub.stage_cost())
 
             # backward：每个阶段对 K 个试探状态各枚举场景，生成 K 条割
             new_cuts = [[] for _ in range(T + 2)]
@@ -276,7 +320,11 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
             result_q.put(("ok", wid, int(round_id), float(totals.mean()),
                           n_solves, new_cuts, lift_stats,
                           {"calls": sync_calls, "skipped": sync_skipped,
-                           "wait_s": sync_wait_s}))
+                           "wait_s": sync_wait_s},
+                          {"trials": heur_trials, "used": heur_used,
+                           "fail": heur_fail, "sa_moves": sa_moves,
+                           "sa_accepted": sa_accepted,
+                           "sa_time_s": sa_time_s}))
         except Exception:
             result_q.put(("err", wid, int(round_id), traceback.format_exc()))
 
@@ -369,6 +417,12 @@ class AsyncIterationEngine:
         self._pool_version = self._ctx.Value("q", 0)
         self.n_sync_wait_s = 0.0
         self.n_sync_skipped = 0
+        self.n_heur_trials = 0
+        self.n_heur_used = 0
+        self.n_heur_fail = 0
+        self.n_sa_moves = 0
+        self.n_sa_accepted = 0
+        self.sa_time_s = 0.0
         self._proc = []
         # 每个 worker 已持有的割 uid。不能用「全局前缀长度」，因为不同 worker 的
         # 完成顺序会让全局列表的追加顺序与本 worker 的本地顺序不同。
@@ -645,6 +699,28 @@ class AsyncIterationEngine:
                 "n_block_syncs": self.n_block_syncs,
                 "n_sync_skipped": self.n_sync_skipped,
                 "sync_wait_s": self.n_sync_wait_s,
+                "forward_heuristic": {
+                    "enabled": bool(getattr(self.cfg, "forward_heuristic", False)),
+                    "lp_p0": float(getattr(self.cfg, "heur_lp_p0", 0.5)),
+                    "lp_p1": float(getattr(self.cfg, "heur_lp_p1", 0.95)),
+                    "ramp_iters": int(getattr(
+                        self.cfg, "heur_ramp_iters", 1000)),
+                    "alpha": float(getattr(self.cfg, "heur_alpha", 1.0)),
+                    "target_frac": float(getattr(
+                        self.cfg, "heur_target_frac", 1.0)),
+                    "sa_iters": int(getattr(self.cfg, "heur_sa_iters", 20)),
+                    "sa_t0_frac": float(getattr(
+                        self.cfg, "heur_sa_t0_frac", 0.02)),
+                    "sa_cooling": float(getattr(
+                        self.cfg, "heur_sa_cooling", 0.9)),
+                    "sa_step": float(getattr(self.cfg, "heur_sa_step", 1.0)),
+                    "n_trials": self.n_heur_trials,
+                    "n_used": self.n_heur_used,
+                    "n_fail": self.n_heur_fail,
+                    "n_sa_moves": self.n_sa_moves,
+                    "n_sa_accepted": self.n_sa_accepted,
+                    "sa_time_s": self.sa_time_s,
+                },
                 "n_cut_dropped": self.n_cut_dropped,
                 "integer_mode": bool(getattr(self.cfg, "integer_enabled", False)),
                 "integer_scope": str(getattr(self.cfg, "integer_scope", "none")),
@@ -714,17 +790,27 @@ class AsyncIterationEngine:
                 outstanding -= 1
                 if kind == "err":
                     raise RuntimeError(f"async worker {wid} iter {k} failed:\n{rest[0]}")
-                if len(rest) >= 5:
+                if len(rest) >= 6:
+                    (total, n_solves, new_cuts, lift_stats, sync_stats,
+                     heur_stats) = rest[:6]
+                elif len(rest) >= 5:
                     total, n_solves, new_cuts, lift_stats, sync_stats = rest[:5]
+                    heur_stats = {}
                 elif len(rest) >= 4:
                     total, n_solves, new_cuts, lift_stats = rest[:4]
-                    sync_stats = {}
+                    sync_stats, heur_stats = {}, {}
                 else:
                     total, n_solves, new_cuts = rest[:3]
-                    lift_stats, sync_stats = {}, {}
+                    lift_stats, sync_stats, heur_stats = {}, {}, {}
                 self._merge(wid, new_cuts)
                 self.n_sync_wait_s += float(sync_stats.get("wait_s", 0.0))
                 self.n_sync_skipped += int(sync_stats.get("skipped", 0))
+                self.n_heur_trials += int(heur_stats.get("trials", 0))
+                self.n_heur_used += int(heur_stats.get("used", 0))
+                self.n_heur_fail += int(heur_stats.get("fail", 0))
+                self.n_sa_moves += int(heur_stats.get("sa_moves", 0))
+                self.n_sa_accepted += int(heur_stats.get("sa_accepted", 0))
+                self.sa_time_s += float(heur_stats.get("sa_time_s", 0.0))
                 self.n_solves += int(n_solves)
                 self.n_iterations += 1
                 self.last_iter = max(self.last_iter, int(k))

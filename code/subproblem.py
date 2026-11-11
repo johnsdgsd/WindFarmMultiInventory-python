@@ -34,42 +34,12 @@ import numpy as np
 from coptpy import COPT, LinExpr, quicksum
 
 from utils import copt_env as ce
-from .transition import tail_cdf
+from .forward_heuristic import (HeuristicInfeasible,
+                                heuristic_step as forward_heuristic_step)
+from .transition import round_repair_n, tail_cdf
 
 CUT_EPS = 1e-12
 INF = COPT.INFINITY
-
-
-def round_repair_n(n, N, digits: int, repair_tol: float) -> np.ndarray:
-    """把 n 块 round 到 digits 位小数，并只修正不超过 repair_tol 的 Σn 超额。
-
-    逐格 round 后行和仍可能略超 N（多个分量各带 0.5e-digits 的舍入误差）。
-    这里从最大分量开始扣除超额，保证分量非负且 Σn ≤ N；超过 repair_tol 说明
-    不是数值残差，直接报错。不缩放、不改动 n 之外的状态分量。
-    """
-    nr = np.round(np.asarray(n, dtype=float), int(digits)).copy()
-    N = np.asarray(N, dtype=float)
-    excess = nr.sum(axis=1) - N
-    bad = excess > float(repair_tol) + 1e-12
-    if np.any(bad):
-        r = int(np.argmax(excess))
-        raise ValueError(
-            f"仓库 {r + 1} 期末 Σn={nr[r].sum():.12f} 超机队 "
-            f"{excess[r]:.3e} > state_repair_tol={repair_tol:g}")
-    for r in range(nr.shape[0]):
-        rem = float(excess[r])
-        if rem <= 1e-12:
-            continue
-        for j in np.argsort(-nr[r]):
-            if rem <= 1e-12:
-                break
-            take = min(float(nr[r, j]), rem)
-            nr[r, j] -= take
-            rem -= take
-        if rem > 1e-9:
-            raise ValueError(
-                f"仓库 {r + 1} 的 Σn 超额 {excess[r]:.3e} 无法从非负分量中扣除")
-    return nr
 
 
 def make_stage_subproblem(t, prob, cfg=None):
@@ -490,6 +460,24 @@ class StageSubproblem:
         self._obj = ce.solve(self.model, mip=False)
         self._last_mip = False
         return self
+
+    def heuristic_step(self, x, scene, *, stage_t: int | None = None,
+                       cuts_next=None, rng=None):
+        """固定状态/场景，用 SA 构造本阶段全部决策；不调用求解器。
+
+        async 的共享模型 t 恒为 1，调用方必须用 stage_t 传真实阶段号。
+        预期不可行时返回 None；其它异常继续抛出，避免掩盖代码错误。
+        """
+        if self.is_virtual:
+            raise RuntimeError("虚拟首阶段不走前向启发式")
+        try:
+            return forward_heuristic_step(
+                prob=self.prob_data,
+                t=int(self.t if stage_t is None else stage_t),
+                x=x, scene=scene, cfg=self.cfg,
+                cuts_next=cuts_next, rng=rng)
+        except HeuristicInfeasible:
+            return None
 
     def solve_lb_mip(self) -> float:
         """阶段 0 的整数主问题下界。

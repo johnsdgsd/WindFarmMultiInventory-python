@@ -376,6 +376,16 @@ class SolverConfig:
     cut_select_keep_rounds: int
     stage_block_size: int
     stage_block_adaptive: bool
+    forward_heuristic: bool
+    heur_lp_p0: float
+    heur_lp_p1: float
+    heur_ramp_iters: int
+    heur_alpha: float
+    heur_target_frac: float
+    heur_sa_iters: int
+    heur_sa_t0_frac: float
+    heur_sa_cooling: float
+    heur_sa_step: float
     stage_block_sizes: tuple[int, ...]
     stage_block_switch_s: tuple[float, ...]
     integer: IntegerConfig
@@ -456,6 +466,23 @@ class SolverConfig:
         if self.stage_block_size < 0:
             raise ValueError(f"[training] stage_block_size 不得为负（0 = 关闭），"
                              f"实际 {self.stage_block_size}")
+        if not (0.0 <= self.heur_lp_p0 <= 1.0
+                and 0.0 <= self.heur_lp_p1 <= 1.0):
+            raise ValueError("[training] heur_lp_p0/heur_lp_p1 必须在 [0,1]")
+        if self.heur_ramp_iters < 1:
+            raise ValueError("[training] heur_ramp_iters 必须 ≥ 1")
+        if self.heur_alpha <= 0:
+            raise ValueError("[training] heur_alpha 必须为正")
+        if not (0.0 < self.heur_target_frac <= 1.0):
+            raise ValueError("[training] heur_target_frac 必须在 (0,1]")
+        if self.heur_sa_iters < 1:
+            raise ValueError("[training] heur_sa_iters 必须 ≥ 1")
+        if self.heur_sa_t0_frac <= 0:
+            raise ValueError("[training] heur_sa_t0_frac 必须为正")
+        if not (0.0 < self.heur_sa_cooling < 1.0):
+            raise ValueError("[training] heur_sa_cooling 必须在 (0,1)")
+        if self.heur_sa_step <= 0:
+            raise ValueError("[training] heur_sa_step 必须为正")
         if self.stage_block_adaptive:
             if not self.stage_block_sizes:
                 raise ValueError(
@@ -518,6 +545,7 @@ class SolverConfig:
             f"  割筛选 {self.cut_selection}"
             f"  阶段块 {self.stage_block_desc()}"
             f"  整数 {self.integer.describe()}"
+            f"  前向启发式 {'on' if self.forward_heuristic else 'off'}"
             f"  重要性采样 {self.importance_sampling.describe()}"
             f"  割提升 {self.cut_lift.describe()}"
             f"  时限 {self.max_train_seconds or '不限'} s",
@@ -611,6 +639,23 @@ def load_solver_config(path, *, resolve: bool = True) -> SolverConfig:
                                   "solver.toml/training")),
         stage_block_adaptive=bool(_opt(tr, "stage_block_adaptive", False,
                                        "solver.toml/training")),
+        forward_heuristic=bool(_opt(tr, "forward_heuristic", False,
+                                    "solver.toml/training")),
+        heur_lp_p0=float(_opt(tr, "heur_lp_p0", 0.5, "solver.toml/training")),
+        heur_lp_p1=float(_opt(tr, "heur_lp_p1", 0.95, "solver.toml/training")),
+        heur_ramp_iters=int(_opt(tr, "heur_ramp_iters", 1000,
+                                 "solver.toml/training")),
+        heur_alpha=float(_opt(tr, "heur_alpha", 1.0, "solver.toml/training")),
+        heur_target_frac=float(_opt(tr, "heur_target_frac", 1.0,
+                                    "solver.toml/training")),
+        heur_sa_iters=int(_opt(tr, "heur_sa_iters", 20,
+                               "solver.toml/training")),
+        heur_sa_t0_frac=float(_opt(tr, "heur_sa_t0_frac", 0.02,
+                                   "solver.toml/training")),
+        heur_sa_cooling=float(_opt(tr, "heur_sa_cooling", 0.9,
+                                   "solver.toml/training")),
+        heur_sa_step=float(_opt(tr, "heur_sa_step", 1.0,
+                                "solver.toml/training")),
         stage_block_sizes=tuple(int(x) for x in _opt(
             tr, "stage_block_sizes", [], "solver.toml/training")),
         stage_block_switch_s=tuple(float(x) for x in _opt(
