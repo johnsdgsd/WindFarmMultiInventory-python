@@ -36,6 +36,7 @@ from coptpy import COPT, LinExpr, quicksum
 from utils import copt_env as ce
 from .forward_heuristic import (HeuristicInfeasible,
                                 heuristic_step as forward_heuristic_step)
+from .qperturb_heuristic import qperturb_step as qperturb_stage
 from .transition import round_repair_n, tail_cdf
 
 CUT_EPS = 1e-12
@@ -478,6 +479,12 @@ class StageSubproblem:
                 cuts_next=cuts_next, rng=rng)
         except HeuristicInfeasible:
             return None
+
+    def qperturb_step(self, x, scene, *, rng=None):
+        """旧启发式：先解 base LP/MIP，扰动 q 后固定 q 重解。"""
+        if self.is_virtual:
+            raise RuntimeError("虚拟首阶段不走 q 扰动启发式")
+        return qperturb_stage(self, x, scene, rng=rng)
 
     def solve_lb_mip(self) -> float:
         """阶段 0 的整数主问题下界。

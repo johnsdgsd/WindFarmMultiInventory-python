@@ -10,6 +10,7 @@ cut_select_eps = 1e-6
 cut_select_keep_rounds = 0
 stage_block_size = 2
 forward_heuristic = true
+forward_heuristic_mode = "sa"
 heur_lp_p0 = 0.5
 heur_lp_p1 = 0.95
 heur_ramp_iters = 1000

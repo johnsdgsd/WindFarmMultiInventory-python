@@ -26,6 +26,7 @@ cut_select_eps = 1e-6           # ε0：判断两个割值是否并列
 cut_select_keep_rounds = 0      # 试探点保留的轮数；0 = 全部保留（文档原版）
 stage_block_size = 10
 forward_heuristic = true
+forward_heuristic_mode = "sa"
 heur_lp_p0 = 0.5           # 早期 50% 阶段解 LP、50% 走 SA；随轮次升高
 heur_lp_p1 = 0.95
 heur_ramp_iters = 1000

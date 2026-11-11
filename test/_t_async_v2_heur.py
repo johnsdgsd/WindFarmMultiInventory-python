@@ -76,11 +76,15 @@ def main():
             f"历史 LB max : {eng.lb_best:.6f}",
             f"割数        : {sum(len(c) for c in eng.cuts[1:eng.T + 1])}",
             f"累计求解    : {eng.n_solves}",
-            f"启发式      : trials={h.get('n_trials', 0)} "
+            f"启发式      : mode={h.get('mode', 'none')} "
+            f"trials={h.get('n_trials', 0)} "
             f"used={h.get('n_used', 0)} fail={h.get('n_fail', 0)}",
             f"SA          : moves={h.get('n_sa_moves', 0)} "
             f"accepted={h.get('n_sa_accepted', 0)} "
             f"time={h.get('sa_time_s', 0.0):.3f}s",
+            f"qperturb    : perturbed={h.get('n_qp_perturbed', 0)} "
+            f"base={h.get('n_qp_base', 0)} "
+            f"solves={h.get('n_qp_solves', 0)}",
             f"用时        : {time.time() - t0:.1f} s",
             "",
             "训练与仿真分离：UB/gap 需要另跑 simulate.py",
