@@ -7,7 +7,8 @@
   · 支持 cut_selection = "none" / "lml1" / "julia"；
   · 支持后向 Strengthened Benders 割提升（cut_lift），触发由主进程决定；
   · 每个 iteration 仍是一个前向路径、后向枚举 n_backward_samples=0 的全部场景；
-  · 下界在主进程重建 stage 0 LP，使用全局活跃割；
+  · 下界在主进程重建 stage 0 子问题，使用全局活跃割；整数模式解 MIP
+    （BestBnd 兜底），连续模式解 LP；
   · worker 持“缓存全部割 + 活跃割”的两层池，支持 Julia 式割的复活；
   · worker 的模型缓存与 code/subproblem.py 的 assemble 契约不变。
 """
@@ -20,6 +21,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .bandit import BanditDuality
 from .cut import Cut, pack, trivial_cut
 from .cut_pool import CutPool
 
@@ -60,6 +62,7 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
     lift_rel = float(getattr(lcfg, "rel_gap", 0.0))
     lift_abs = float(getattr(lcfg, "abs_gap", 0.0))
     lift_margin = float(getattr(lcfg, "safety_margin", 1e-6))
+    lift_release = bool(getattr(lcfg, "release_integrality", False))
     # 一个模型对应一个「未来割阶段」s：求解第 t=s−1 期时使用 cuts[s]。
     # s=1 由虚拟阶段 0 使用；s=2..T+1 是普通真实阶段模型（base 同 t=1）。
     cut_models = {}
@@ -190,7 +193,8 @@ def _worker_main(wid, prob, make_sub, cfg, T, initial_state, initial_cuts,
                             nu = sub.solve_lift(
                                 beta_j, time_limit=lift_time,
                                 rel_gap=lift_rel, abs_gap=lift_abs,
-                                safety_margin=lift_margin, value=lift_value)
+                                safety_margin=lift_margin, value=lift_value,
+                                release_integrality=lift_release)
                             if nu is None:
                                 nu = lp_obj - float(beta_j @ xb)
                                 lift_stats["n_fb"] += 1
@@ -270,6 +274,15 @@ class AsyncIterationEngine:
         self._cl_threshold = float(
             getattr(self.cut_lift_cfg, "lb_gain_threshold", 20.0))
         self._cl_min_round = int(getattr(self.cut_lift_cfg, "min_round", 50))
+        self.bandit_enabled = bool(getattr(cfg, "bandit_duality", False))
+        if self.bandit_enabled and not self.cut_lift_enabled:
+            raise ValueError("bandit_duality=true 需要 [cut_lift].enabled=true")
+        self.bandit = (BanditDuality(
+            seed=int(cfg.seed),
+            atol=float(getattr(cfg, "bandit_atol", 1e-6)))
+            if self.bandit_enabled else None)
+        self._iter_arm = {}
+        self._bandit_log = []
         self.n_lift_cuts = 0
         self.n_lift_mip = 0
         self.n_lift_fallback = 0
@@ -302,6 +315,8 @@ class AsyncIterationEngine:
         self._view_active = []
         self._lb_sub = None
         self._lb_key = None
+        self.lb_solver = ("mip" if getattr(self.cfg, "integer_enabled", False)
+                          else "lp")
         self._closed = False
 
     def _start_workers(self):
@@ -334,6 +349,12 @@ class AsyncIterationEngine:
                 and int(k) >= self._cl_min_round
                 and self._prev_lb_delta < self._cl_threshold)
 
+    def _arm_now(self, k: int) -> str:
+        """为本次 iteration 选择臂；bandit 关闭时沿用原 cut_lift 规则。"""
+        if self.bandit_enabled:
+            return self.bandit.current_arm
+        return "strengthened" if self._lift_now(k) else "continuous"
+
     def _dispatch(self, wid: int, k: int):
         if self.cut_pool is not None:
             return self._dispatch_julia(wid, k)
@@ -354,8 +375,11 @@ class AsyncIterationEngine:
         scene_paths = [self.rng.integers(0, self.n_scenes,
                                         size=self.T).tolist()
                        for _ in range(self.paths_per_task)]
+        arm = self._arm_now(k)
+        self._iter_arm[int(k)] = arm
         self._task_q[wid].put(
-            ("iter", k, scene_paths, deltas, deletions, self._lift_now(k)))
+            ("iter", k, scene_paths, deltas, deletions,
+             arm == "strengthened"))
 
     def _dispatch_julia(self, wid: int, k: int):
         """同步“全部割缓存”和“当前活跃割”两类增量。"""
@@ -382,9 +406,11 @@ class AsyncIterationEngine:
         scene_paths = [self.rng.integers(0, self.n_scenes,
                                         size=self.T).tolist()
                        for _ in range(self.paths_per_task)]
+        arm = self._arm_now(k)
+        self._iter_arm[int(k)] = arm
         self._task_q[wid].put(
             ("iterj", k, scene_paths, new_cuts, activate, deactivate,
-             self._lift_now(k)))
+             arm == "strengthened"))
 
     def _merge(self, wid: int, new_cuts):
         if self.cut_pool is not None:
@@ -427,6 +453,15 @@ class AsyncIterationEngine:
             self.cuts[t] = self.cut_pool.active(t)
             n += len(self.cuts[t])
         return n
+
+    def restore_bandit(self, meta: dict | None) -> None:
+        """续训时恢复 Bandit 的奖励/当前臂状态。"""
+        if not self.bandit_enabled or not meta:
+            return
+        b = meta.get("bandit_duality")
+        if isinstance(b, dict) and b.get("arms"):
+            self.bandit = BanditDuality.from_meta(
+                b, seed=int(self.cfg.seed))
 
     def seed_initial_cuts(self, cuts_by_stage) -> int:
         """从割文件建立起始割池；必须在 train() 前调用。
@@ -494,10 +529,18 @@ class AsyncIterationEngine:
             self._lb_sub = self.make_sub(0, self.prob, self.cfg)
         key = (int(self.n_iterations), "lb")
         self._lb_sub.assemble(pack(self.cuts[1], self.state_dim), key=key)
-        self._lb_sub.set_state(self.initial_state)
-        self._lb_sub.solve_lp()
+        int_mode = bool(getattr(self.cfg, "integer_enabled", False))
+        self._lb_sub.set_state(self.initial_state, require_int=int_mode)
+        if int_mode:
+            # 与 SDDP.jl calculate_bound 一致：整数状态子问题解 MIP。
+            # 未证到最优时 solve_lb_mip 退 BestBnd（仍是合法下界）。
+            lb = self._lb_sub.solve_lb_mip()
+            self.lb_solver = "mip"
+        else:
+            self._lb_sub.solve_lp()
+            lb = float(self._lb_sub.obj)
+            self.lb_solver = "lp"
         self.n_solves += 1
-        lb = float(self._lb_sub.obj)
         self.lb_best = max(self.lb_best, lb)
         return lb
 
@@ -529,7 +572,7 @@ class AsyncIterationEngine:
                 "n0_mode": str(getattr(self.prob, "n0_mode", "continuous")),
                 "forward_solver": ("mip" if getattr(self.cfg, "integer_enabled", False)
                                    else "lp"),
-                "lower_bound_solver": "lp",
+                "lower_bound_solver": self.lb_solver,
                 "cut_lift": {
                     "enabled": self.cut_lift_enabled,
                     "scope": self._cl_scope,
@@ -547,12 +590,18 @@ class AsyncIterationEngine:
                         self.cut_lift_cfg, "safety_margin", 1e-6)),
                     "lb_gain_threshold": self._cl_threshold,
                     "min_round": self._cl_min_round,
+                    "release_integrality": bool(getattr(
+                        self.cut_lift_cfg, "release_integrality", False)),
                     "n_lift_cuts": self.n_lift_cuts,
                     "n_lift_mip": self.n_lift_mip,
                     "n_fallback": self.n_lift_fallback,
                     "lift_rounds": list(self._lift_rounds),
                     "lift_gains": list(self._lift_gains),
-                }}
+                },
+                "bandit_duality": (
+                    self.bandit.meta() if self.bandit is not None else
+                    {"enabled": False}),
+            }
 
     def checkpoint(self):
         if self.results_dir is None:
@@ -607,6 +656,11 @@ class AsyncIterationEngine:
                                        else lb - self._last_lb)
                 self._last_lb = lb
                 elapsed = time.time() - t0
+                arm_used = self._iter_arm.pop(int(k), None)
+                bandit_rec = None
+                if self.bandit_enabled:
+                    bandit_rec = self.bandit.observe(lb, elapsed, arm_used)
+                    self._bandit_log.append(dict(bandit_rec, iter=int(k)))
                 rec = {"iter": int(k), "lb": lb, "sim": float(total),
                        "time": elapsed, "solves": self.n_solves,
                        "n_cuts": sum(len(c) for c in self.cuts[1:self.T + 1]),
@@ -614,7 +668,9 @@ class AsyncIterationEngine:
                        "paths_per_task": self.paths_per_task,
                        "lift_used": bool(lift_used),
                        "lift_gain": lift_gain,
-                       "lift_fallback": int(lift_stats.get("n_fb", 0))}
+                       "lift_fallback": int(lift_stats.get("n_fb", 0)),
+                       "arm_used": arm_used,
+                       "bandit": bandit_rec}
                 history.append(rec)
                 if self.on_iter is not None:
                     self.on_iter(rec)
@@ -624,9 +680,13 @@ class AsyncIterationEngine:
                         lift_txt = (f" | lift={int(lift_used)}"
                                     f" gain={lift_gain:+.1f}"
                                     f" fb={rec['lift_fallback']}")
-                    self.log(f"  async iter {k:5d} | LB={lb:14.4f} | "
+                    arm_txt = (f" | arm={rec['arm_used']}->"
+                               f"{(rec.get('bandit') or {}).get('next_arm', '')}"
+                               if self.bandit_enabled else "")
+                    lb_tag = "MIP" if self.lb_solver == "mip" else "LP"
+                    self.log(f"  async iter {k:5d} | LB({lb_tag})={lb:14.4f} | "
                              f"sim={total:14.4f} | cuts={rec['n_cuts']:6d} | "
-                             f"{elapsed:7.1f} s{lift_txt}")
+                             f"{elapsed:7.1f} s{lift_txt}{arm_txt}")
                 ckpt_iv = float(getattr(self.cfg, "checkpoint_interval", 0) or 0)
                 if (self.results_dir is not None and ckpt_iv > 0
                         and time.time() - last_ckpt >= ckpt_iv):

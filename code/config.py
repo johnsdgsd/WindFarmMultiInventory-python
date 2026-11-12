@@ -306,6 +306,7 @@ class CutLiftConfig:
     safety_margin: float = 1e-6
     lb_gain_threshold: float = 20.0
     min_round: int = 50
+    release_integrality: bool = False
 
     def __post_init__(self) -> None:
         if self.scope not in ("all", "last", "tail", "selected"):
@@ -358,6 +359,7 @@ class CutLiftConfig:
             scope = f"selected({list(self.lift_stages)})"
         return (f"on  scope={scope}  mode={self.mode}  value={self.value}  "
                 f"time_limit={self.time_limit:g}s  rel_gap={self.rel_gap:g}"
+                f"  release_integrality={self.release_integrality}"
                 + (f"  threshold={self.lb_gain_threshold:g}  min_round={self.min_round}"
                    if self.mode == "stagnation" else ""))
 
@@ -377,6 +379,8 @@ class SolverConfig:
     integer: IntegerConfig
     importance_sampling: ImportanceSamplingConfig
     cut_lift: CutLiftConfig
+    bandit_duality: bool
+    bandit_atol: float
     # 并行
     n_processes: int
     threads_per_process: int
@@ -471,6 +475,12 @@ class SolverConfig:
         if self.lb_time_limit <= 0:
             raise ValueError(f"[numerics] lb_time_limit 必须为正，"
                              f"实际 {self.lb_time_limit}")
+        if self.bandit_atol < 0:
+            raise ValueError(f"[training] bandit_atol 不得为负，"
+                             f"实际 {self.bandit_atol}")
+        if self.bandit_duality and not self.cut_lift_enabled:
+            raise ValueError(
+                "[training] bandit_duality=true 需要 [cut_lift].enabled=true")
 
     def describe(self) -> str:
         return "\n".join([
@@ -481,6 +491,8 @@ class SolverConfig:
             f"  整数 {self.integer.describe()}"
             f"  重要性采样 {self.importance_sampling.describe()}"
             f"  割提升 {self.cut_lift.describe()}"
+            f"  BanditDuality {'on' if self.bandit_duality else 'off'}"
+            f"（atol={self.bandit_atol:g}）"
             f"  时限 {self.max_train_seconds or '不限'} s",
             f"并行   进程 {self.n_processes}  每进程 COPT 线程 {self.threads_per_process}",
             f"仿真   路径 {self.n_simulations}  块大小 {self.chunk_size}",
@@ -555,6 +567,9 @@ def load_solver_config(path, *, resolve: bool = True) -> SolverConfig:
                                          "solver.toml/cut_lift")),
             min_round=int(_opt(cl_raw, "min_round", 50,
                                "solver.toml/cut_lift")),
+            release_integrality=bool(_opt(
+                cl_raw, "release_integrality", False,
+                "solver.toml/cut_lift")),
         )
     cfg = SolverConfig(
         iterations=int(_req(tr, "iterations", "solver.toml/training")),
@@ -571,6 +586,10 @@ def load_solver_config(path, *, resolve: bool = True) -> SolverConfig:
         integer=integer,
         importance_sampling=importance,
         cut_lift=cut_lift,
+        bandit_duality=bool(_opt(tr, "bandit_duality", False,
+                                 "solver.toml/training")),
+        bandit_atol=float(_opt(tr, "bandit_atol", 1e-6,
+                               "solver.toml/training")),
         n_processes=int(_req(pa, "n_processes", "solver.toml/parallel")),
         threads_per_process=int(_req(pa, "threads_per_process", "solver.toml/parallel")),
         n_simulations=int(_req(si, "n_simulations", "solver.toml/simulation")),

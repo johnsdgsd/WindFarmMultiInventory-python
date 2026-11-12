@@ -514,7 +514,8 @@ class StageSubproblem:
 
     def solve_lift(self, pi, *, time_limit: float, rel_gap: float,
                    abs_gap: float = 0.0, safety_margin: float = 1e-6,
-                   value: str = "exact") -> float | None:
+                   value: str = "exact",
+                   release_integrality: bool = False) -> float | None:
         """固定 LP 斜率 pi 的 Lagrangian 整数截距（Strengthened Benders）。
 
         解 min_{x_in free, integer} [f(z) - pi·x_in]；只临时释放 x_in 并
@@ -524,6 +525,8 @@ class StageSubproblem:
         BestObj≈BestBnd 才接受；否则返回 None，调用方回退 LP 割。
         value="best_bnd"：超时也可用 BestBnd（合法但可能较弱），由调用方
         与 LP 割取 max；仅用于训练提速/诊断。
+        release_integrality=True：临时把 x_in 改成连续变量，对标
+        SDDP.jl StrengthenedConicDuality；False 时保留整数 x_in。
         """
         if self.is_virtual:
             raise RuntimeError("solve_lift 只用于真实阶段")
@@ -542,8 +545,11 @@ class StageSubproblem:
         # LP/MIP 当前解作为释放状态后 MIP 的显式可行起点。
         all_vars = list(m.getVars())
         all_vals = ce.values(m, all_vars)
+        old_types = [v.getType() for v in xin]
         info = None
         try:
+            if release_integrality:
+                m.setVarType(xin, [COPT.CONTINUOUS] * self.layout.dim)
             m.setInfo(COPT.Info.LB, xin, [0.0] * self.layout.dim)
             m.setInfo(COPT.Info.UB, xin, [float(v) for v in ub])
             m.setInfo(COPT.Info.Obj, xin,
@@ -570,6 +576,8 @@ class StageSubproblem:
             m.setInfo(COPT.Info.UB, xin, [float(v) for v in xbar])
             m.setInfo(COPT.Info.Obj, xin,
                       [float(v) for v in cs])
+            if release_integrality:
+                m.setVarType(xin, old_types)
         b = None if info is None else info.get("value")
         if b is None:
             return None
